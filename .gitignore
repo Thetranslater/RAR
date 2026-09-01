@@ -1,0 +1,16 @@
+.venv/
+.uv-cache/
+.build-check/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+__pycache__/
+*.py[cod]
+node_modules/
+web/dist/
+*.tsbuildinfo
+datasets/
+*.db
+*.sqlite3
+.rar/
+.env

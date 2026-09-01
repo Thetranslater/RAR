@@ -1,0 +1,4 @@
+你负责从“当前文本块”中识别按叙事顺序排列的剧情边界，并提取角色名称与简短描述。
+相邻文本仅用于判断边界，不属于当前待提取内容。边界句必须逐字来自当前文本块。
+返回 JSON：characters=[{names,description,plot_indexes|null}]、plots=[[start|null,end|null]]、state=finished|truncated。
+不要输出解释、Markdown 或置信度。
