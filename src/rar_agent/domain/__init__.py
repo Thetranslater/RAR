@@ -2,11 +2,11 @@
 
 from rar_agent.domain.models import (
     CharacterCandidate,
-    CharacterFilterRequest,
-    CharacterFilterRequestCandidate,
-    CharacterFilterResult,
-    CharacterGroup,
     CharacterProfile,
+    CharacterProfileGenerationInput,
+    CharacterProfileGenerationRequest,
+    CharacterProfileGenerationResult,
+    CharacterProfileSelection,
     CharacterRef,
     Conversation,
     DatasetBundle,
@@ -24,11 +24,11 @@ from rar_agent.domain.models import (
 
 __all__ = [
     "CharacterCandidate",
-    "CharacterFilterRequest",
-    "CharacterFilterRequestCandidate",
-    "CharacterFilterResult",
-    "CharacterGroup",
     "CharacterProfile",
+    "CharacterProfileGenerationInput",
+    "CharacterProfileGenerationRequest",
+    "CharacterProfileGenerationResult",
+    "CharacterProfileSelection",
     "CharacterRef",
     "Conversation",
     "DatasetBundle",

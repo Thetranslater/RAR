@@ -7,8 +7,8 @@ non-commercial use and exports maintained DatasetBundle files to ShareGPT JSONL.
 RAR combines two execution paths behind one chat interface:
 
 - `DatasetBuildWorkflow` runs the fixed text pipeline: TextChunk → Plot extraction →
-  global character filtering → Plot reconstruction → dialogue extraction → character
-  profiles → DatasetBundle → ShareGPT.
+  candidate aggregation plus formal-name/profile generation → Plot reconstruction →
+  dialogue extraction → DatasetBundle → ShareGPT.
 - `AgentHarness` handles open-ended inspection, correction, merge, and re-export requests
   through workspace-contained tools. It does not create a dedicated workflow class for
   every task.
@@ -18,14 +18,20 @@ The authoritative implementation specification is in
 
 ## Current V1 capabilities
 
-- UTF-8 text files and ordered multi-resource InputManifests.
+- UTF-8 text files and ordered multi-resource InputManifests, with volume/chapter-aware
+  section splitting before sentence-complete token chunking.
 - File-based checkpoints with `result: {}` placeholders and deterministic resume.
 - Source references from every dialogue back to PlotChunk and, when alignment succeeds,
   TextChunk character spans.
-- One global role-filtering pass followed by per-character profile generation.
+- One profile call per deterministically aggregated character; the selected formal name is
+  moved first and every other observed name is retained as an alias.
 - DatasetBundle, plain-text character profiles, and per-character ShareGPT JSONL.
 - DeepSeek and Qwen through provider-neutral OpenAI-compatible adapters.
 - Project-local SQLite for chat, tool-call, usage, and operational records only.
+- Project-scoped chat management with lazy creation, archive/restore, pagination, and
+  background Agent runs that survive page switching.
+- Temporary approval requests for risky tools, per-chat cancellation, complete-turn context
+  trimming, and one global model-concurrency scheduler shared by Chat and Workflow.
 - Automatic and stage-confirmed extraction modes through the local API and Web UI.
 - Responsive local React chat interface; no remote deployment or account system.
 
@@ -81,6 +87,16 @@ results, but model-backed chat and extraction return a clear configuration error
 The paths are relative to the Project directory. A completed Dataset is written under
 `datasets/<dataset-name>/`; intermediate JSON/JSONL files remain inspectable and are the
 authoritative recovery source.
+
+Existing intermediate files are intentional checkpoints. After changing chunk rules or
+prompt templates, start a new extraction (or explicitly remove the old Dataset work files)
+to observe the new behavior; resuming an existing Dataset reuses its completed records.
+
+For a low-cost end-to-end smoke test, enable `debug` in the Web extraction dialog or API
+request, or pass `--debug` to `rar-agent extract`. Chunking still processes the complete
+input, while plot extraction and dialogue extraction each process at most five units;
+character filtering, profile generation, DatasetBundle assembly, and ShareGPT export run
+normally on that limited result.
 
 ## Verification
 

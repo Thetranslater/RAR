@@ -2,20 +2,30 @@
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import json
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from collections.abc import Awaitable, Callable, Set
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, cast
 
 from rar_agent.domain.models import DatasetBundle
 from rar_agent.models.base import JsonObject, ToolCall, ToolDefinition
 from rar_agent.storage.artifacts import DatasetPaths
 
 ToolEffect = Literal["read", "write", "delete", "network", "shell"]
+ApprovalMode = Literal["auto", "always"]
+ToolRisk = Literal["low", "medium", "high"]
 ToolHandler = Callable[[JsonObject], JsonObject | Awaitable[JsonObject]]
 ApprovalCallback = Callable[[ToolCall, ToolEffect], bool | Awaitable[bool]]
+
+
+@dataclass(frozen=True, slots=True)
+class ToolAuthorization:
+    mode: ApprovalMode = "auto"
+    risk: ToolRisk = "low"
+    reason: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -23,6 +33,18 @@ class RegisteredTool:
     definition: ToolDefinition
     effect: ToolEffect
     handler: ToolHandler
+    authorization: ToolAuthorization = field(default_factory=ToolAuthorization)
+
+
+@dataclass(frozen=True, slots=True)
+class ToolApproval:
+    call_id: str
+    tool_name: str
+    description: str
+    arguments: JsonObject
+    effect: ToolEffect
+    risk: ToolRisk
+    reason: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -54,17 +76,39 @@ class ToolDispatcher:
             raise ValueError("tool names must be unique")
         self._approval = approval
 
-    def definitions(self, names: set[str] | None = None) -> list[ToolDefinition]:
+    def definitions(self, names: Set[str] | None = None) -> list[ToolDefinition]:
         return [
             tool.definition
             for name, tool in self._tools.items()
             if names is None or name in names
         ]
 
-    async def dispatch(self, call: ToolCall) -> ToolObservation:
+    def approval_for(self, call: ToolCall) -> ToolApproval | None:
+        tool = self._tools.get(call.name)
+        if tool is None or tool.authorization.mode == "auto":
+            return None
+        return ToolApproval(
+            call_id=call.call_id,
+            tool_name=tool.definition.name,
+            description=tool.definition.description,
+            arguments=call.arguments,
+            effect=tool.effect,
+            risk=tool.authorization.risk,
+            reason=tool.authorization.reason,
+        )
+
+    async def dispatch(
+        self, call: ToolCall, *, approval_granted: bool = False
+    ) -> ToolObservation:
         tool = self._tools.get(call.name)
         if tool is None:
             return ToolObservation(False, {"error": f"unknown tool: {call.name}"}, "read")
+        if tool.authorization.mode == "always" and not approval_granted:
+            return ToolObservation(
+                False,
+                {"error": "operation requires user approval"},
+                tool.effect,
+            )
         if self._approval is not None:
             approved = self._approval(call, tool.effect)
             if inspect.isawaitable(approved):
@@ -72,7 +116,11 @@ class ToolDispatcher:
             if not approved:
                 return ToolObservation(False, {"error": "operation was not approved"}, tool.effect)
         try:
-            value = tool.handler(call.arguments)
+            if inspect.iscoroutinefunction(tool.handler):
+                value = tool.handler(call.arguments)
+            else:
+                sync_handler = cast(Callable[[JsonObject], Any], tool.handler)
+                value = await asyncio.to_thread(sync_handler, call.arguments)
             if inspect.isawaitable(value):
                 value = await value
             return ToolObservation(True, value, tool.effect)
@@ -138,10 +186,9 @@ def build_workspace_tools(project_root: Path) -> list[RegisteredTool]:
                     ("input_manifest", paths.input_manifest),
                     ("text_chunks", paths.text_chunks),
                     ("plot_extractions", paths.plot_extractions),
-                    ("character_filter", paths.character_filter),
+                    ("character_profiles", paths.character_profiles),
                     ("plots", paths.plots),
                     ("dialogue_extractions", paths.dialogue_extractions),
-                    ("character_profiles", paths.character_profiles),
                 )
                 intermediates = [
                     {
@@ -257,6 +304,7 @@ def build_workspace_tools(project_root: Path) -> list[RegisteredTool]:
         properties: JsonObject,
         required: list[str],
         handler: ToolHandler,
+        authorization: ToolAuthorization | None = None,
     ) -> RegisteredTool:
         return RegisteredTool(
             ToolDefinition(
@@ -271,6 +319,7 @@ def build_workspace_tools(project_root: Path) -> list[RegisteredTool]:
             ),
             effect,
             handler,
+            authorization or ToolAuthorization(),
         )
 
     path_property = {"type": "string", "description": "Project-relative path"}
@@ -310,6 +359,11 @@ def build_workspace_tools(project_root: Path) -> list[RegisteredTool]:
             {"path": path_property, "content": {"type": "string"}},
             ["path", "content"],
             write_file,
+            ToolAuthorization(
+                mode="always",
+                risk="medium",
+                reason="该操作会创建或覆盖 Project 中的文件。",
+            ),
         ),
         tool(
             "replace_text",
@@ -323,6 +377,11 @@ def build_workspace_tools(project_root: Path) -> list[RegisteredTool]:
             },
             ["path", "old", "new"],
             replace_text,
+            ToolAuthorization(
+                mode="always",
+                risk="medium",
+                reason="该操作会修改 Project 中已有文件的内容。",
+            ),
         ),
         tool(
             "validate_dataset",
@@ -339,5 +398,10 @@ def build_workspace_tools(project_root: Path) -> list[RegisteredTool]:
             {"path": path_property},
             ["path"],
             delete_file,
+            ToolAuthorization(
+                mode="always",
+                risk="high",
+                reason="该操作会删除 Project 中的文件。",
+            ),
         ),
     ]

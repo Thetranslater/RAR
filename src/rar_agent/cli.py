@@ -12,6 +12,7 @@ import uvicorn
 from rar_agent.api.app import AppRuntime, create_app
 from rar_agent.domain.models import InputManifest
 from rar_agent.models.base import ModelClient
+from rar_agent.models.scheduler import DEFAULT_MODEL_CONCURRENCY
 from rar_agent.settings import create_model_client
 from rar_agent.text.tokenizer import TikTokenTokenizer
 from rar_agent.workflow.dataset_build import DatasetBuildWorkflow, WorkflowConfig
@@ -28,6 +29,10 @@ def serve(
     base_url: str | None = None,
     host: str = "127.0.0.1",
     port: int = 8765,
+    max_model_concurrency: int = DEFAULT_MODEL_CONCURRENCY,
+    max_active_chat_turns: int = 4,
+    max_context_tokens: int = 32_768,
+    reserved_output_tokens: int = 4_096,
 ) -> None:
     """Start the local Web service for one Project directory."""
     client: ModelClient | None
@@ -35,7 +40,16 @@ def serve(
         client = create_model_client(provider, base_url=base_url)
     except ValueError:
         client = None
-    runtime = AppRuntime(project, client, model, TikTokenTokenizer())
+    runtime = AppRuntime(
+        project,
+        client,
+        model,
+        TikTokenTokenizer(),
+        max_model_concurrency=max_model_concurrency,
+        max_active_chat_turns=max_active_chat_turns,
+        max_context_tokens=max_context_tokens,
+        reserved_output_tokens=reserved_output_tokens,
+    )
     uvicorn.run(create_app(runtime), host=host, port=port)
 
 
@@ -47,6 +61,10 @@ def extract(
     model: str = "deepseek-chat",
     base_url: str | None = None,
     resume: Annotated[Path | None, typer.Option()] = None,
+    debug: Annotated[
+        bool,
+        typer.Option(help="Limit plot and dialogue extraction to five units."),
+    ] = False,
 ) -> None:
     """Run or resume the fixed text extraction Workflow."""
     manifest_value = InputManifest.model_validate_json(manifest.read_text(encoding="utf-8"))
@@ -54,7 +72,7 @@ def extract(
     workflow = DatasetBuildWorkflow(
         model_client=client,
         tokenizer=TikTokenTokenizer(),
-        config=WorkflowConfig(model=model),
+        config=WorkflowConfig(model=model, debug=debug),
     )
     result = asyncio.run(
         workflow.run(

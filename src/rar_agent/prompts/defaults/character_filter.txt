@@ -1,3 +1,0 @@
-你负责一次性筛选全部角色候选。删除“我、叙述者、同学”等无法稳定指向同一角色的泛称，
-合并同一角色，并从输入名称中选择正式名称。不得创造新名称。
-返回 JSON：characters=[{name,aliases,candidate_indexes}]。不要输出解释或 Markdown。

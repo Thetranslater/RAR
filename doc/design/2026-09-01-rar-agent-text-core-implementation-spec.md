@@ -38,7 +38,7 @@
 
 系统具有两个执行平面：
 
-1. `DatasetBuildWorkflow` 是固定的数据生产流程。它负责输入解析、文字分块、剧情提取、角色筛选、剧情重建、对话提取、角色档案生成、DatasetBundle 组装和 ShareGPT 导出。
+1. `DatasetBuildWorkflow` 是固定的数据生产流程。它负责输入解析、文字分块、剧情提取、候选角色聚合与档案生成、剧情重建、对话提取、DatasetBundle 组装和 ShareGPT 导出。
 2. `AgentHarness` 是通用多轮工具调用循环。修改、合并、修复、检查和重新导出都是普通 Agent 交互，不建立专用 CorrectionRun、MergeRun 或任务处理器层级。
 
 文字核心 Workflow 按以下顺序执行：
@@ -46,11 +46,11 @@
 1. 解析用户输入，生成有序 InputManifest。
 2. 从文字资源生成接近配置 Token 预算、优先保持完整句子的 TextChunk。
 3. 并行执行每个 TextChunk 的 Plot 提取，得到 Plot 边界、连续状态和 CharacterCandidate。
-4. 将全部 CharacterCandidate 交给一次全局模型调用，筛除模糊角色名、合并同一角色并选择正式名称。
-5. 根据原文边界和连续状态确定性重建 Plot，并直接切成用于对话提取的大型 PlotChunk。
-6. 并行从每个 PlotChunk 提取 Utterance；对话提取不接收前后 PlotChunk 上下文。
-7. 按 PlotChunk index 确定性组装 Conversation，使一个 Plot 对应一个 Conversation。
-8. 按角色汇总全部 description，并行生成非空 CharacterProfile。
+4. 按剧情候选的首个名称确定性聚合同一角色的名称和 description；每个聚合角色调用一次角色档案模型，同时选择正式名称并生成档案。
+5. 根据模型选择重排名称：正式名称位于首位，其余输入名称全部保留为别名。
+6. 根据原文边界和连续状态确定性重建 Plot，并直接切成用于对话提取的大型 PlotChunk。
+7. 并行从每个 PlotChunk 提取 Utterance；对话提取不接收前后 PlotChunk 上下文。
+8. 按 PlotChunk index 确定性组装 Conversation，使一个 Plot 对应一个 Conversation。
 9. 生成 DatasetBundle；中间产物不复制进 Bundle，只通过相对路径和 index 引用。
 10. 使用确定性 Exporter 把 DatasetBundle 转换成按目标角色拆分的 ShareGPT 训练样本。
 
@@ -92,7 +92,7 @@ HTML 报告是次要派生能力。V1 只保留 ReportGenerator 接口和报告�
 30. As a user, I want the final source Chunk forced to a finished Plot when no next context exists, so that a model truncation mistake does not leave an impossible open tail.
 31. As a user, I want candidate character names and descriptions collected during Plot extraction, so that later character work reuses the same analysis.
 32. As a user, I want vague names such as narrator, I or classmate filtered before profiles are generated, so that unrelated roles are not merged globally.
-33. As a user, I want all character candidates considered in one global filtering call, so that the model chooses one preferred name per consolidated character.
+33. As a user, I want each deterministically aggregated character processed by one profile call, so that formal-name selection and profile generation happen together.
 34. As a user, I want the filtering model to see names and limited descriptions rather than full Plot text, so that the call stays focused and bounded.
 35. As a user, I want the selected formal name and aliases to come from extracted names, so that filtering does not invent identities.
 36. As a user, I want deterministic alias-overlap merging after model filtering, so that obvious duplicate groups are resolved without another model call.
@@ -110,10 +110,10 @@ HTML 报告是次要派生能力。V1 只保留 ReportGenerator 接口和报告�
 48. As a user, I want no confidence field stored, so that uncalibrated scores do not masquerade as quality guarantees.
 49. As a user, I want one Plot assembled into one Conversation without another model call, so that final grouping is deterministic.
 50. As a user, I want formal speaker aliases normalized to the preferred name, so that final conversations use consistent identities.
-51. As a user, I want temporary names remain local observations rather than global characters, so that generic NPC labels do not collide across Plots.
+51. As a user, I want every observed name retained after formal-name selection, so that alternate names remain available as aliases.
 52. As a user, I want all descriptions for one formal character combined in Plot order, so that profiles reflect narrative development.
 53. As a user, I want exact duplicate descriptions removed but contradictions preserved, so that evolving information is not silently discarded.
-54. As a user, I want oversized profile inputs summarized hierarchically, so that profile generation remains possible without overflowing context.
+54. As a user, I want character descriptions bounded deterministically before profile generation, so that requests stay within the configured context budget.
 55. As a user, I want every formal character to have a non-empty profile, so that DatasetBundle is usable for role training.
 56. As a user, I want profiles exported as plain text, so that they can be reused outside the structured Bundle.
 57. As a user, I want DatasetBundle contain only maintained final results and references, so that intermediate processing data remains separate.
@@ -175,7 +175,7 @@ HTML 报告是次要派生能力。V1 只保留 ReportGenerator 接口和报告�
 - TextChunk: the first processing source produced from text.
 - PlotFragment: one model-extracted Plot boundary observation inside a TextChunk.
 - CharacterCandidate: one raw name, alias and description observation from Plot extraction.
-- CharacterGroup: one filtered and consolidated character before profile generation.
+- ResolvedCharacter: one deterministically aggregated character whose formal name and profile were returned by the profile model.
 - Plot: one reconstructed continuous narrative unit corresponding to one Conversation.
 - PlotChunk: one dialogue-model-sized processing window inside a Plot.
 - Utterance: one extracted role line or Environment narration item.
@@ -227,7 +227,7 @@ HTML 报告是次要派生能力。V1 只保留 ReportGenerator 接口和报告�
 - Provider adapters preserve provider-specific parameters and capabilities instead of forcing every provider into the least common denominator.
 - DeepSeek and Qwen are the initial production adapters.
 - Tests use a scripted fake adapter and never require live model calls.
-- One global default model exists, with optional Stage overrides for Plot extraction, character filtering, dialogue extraction, profile generation, vision and derivative work.
+- One global default model exists, with optional Stage overrides for Plot extraction, character profile generation, dialogue extraction, vision and derivative work.
 - One global scheduler enforces provider and model concurrency limits across runs.
 - Each extraction Unit has at most three model attempts by default.
 - Deterministic parsing or structure repair is attempted before consuming another model call.
@@ -255,10 +255,9 @@ datasets/<dataset-name>/
 ├── work/
 │   ├── text_chunks.jsonl
 │   ├── plot_extractions.jsonl
-│   ├── character_filter.json
+│   ├── character_profiles.jsonl
 │   ├── plots.json
-│   ├── dialogue_extractions.jsonl
-│   └── character_profiles.jsonl
+│   └── dialogue_extractions.jsonl
 ├── dataset.json
 ├── characters/
 ├── exports/
@@ -347,35 +346,34 @@ TextChunk contains exactly the following domain fields:
 - No separate normalization or repair artifact is written. Deterministic correction rules are part of reconstruction, and final corrected output appears only in `plots.json`.
 - Reconstructed Plot has no full `text` field. Its content is represented by ordered PlotChunks.
 - Each Plot contains `index`, open `meta`, `character_refs` and `chunks`.
-- A character reference points to `character_filter.json` plus the CharacterGroup index.
+- A character reference points to `character_profiles.jsonl` plus the resolved character index.
 - Each PlotChunk contains `index`, `text`, `token_count` and source references.
 - Reconstructed Plot text is split directly near the dialogue budget, initially about 5120 Tokens, using sentence-aware boundaries.
 - The RLFF state-extraction split into roughly 512-Token Chunks and later merge step is not used.
 
-### 14. Global character filtering
+### 14. Character aggregation, formal-name selection and profile generation
 
-- Character filtering occurs after Plot extraction and before Plot reconstruction.
+- This Stage occurs after Plot extraction and before Plot reconstruction.
 - Raw candidates are traversed in deterministic source order and assigned transient array indexes. These indexes are not domain IDs.
-- Candidates with the same primary name after trimming surrounding whitespace may be pre-aggregated. No fuzzy, punctuation or semantic merge occurs before the model call.
-- One global model call receives every candidate name and a bounded portion of descriptions. Plot text is not sent.
-- Every name and candidate index is retained in the request; remaining context budget is divided across description snippets.
-- If names alone exceed model context, the Stage fails clearly. V1 does not split global filtering into multiple model calls.
-- The model removes unusable generic names such as “叙述者”“我”“同学”, groups candidates belonging to the same role and chooses one formal name.
-- Formal name and aliases must come from supplied candidate names; the model may not invent a new identity.
-- The result is one `character_filter.json`, not JSONL.
-- Each CharacterGroup contains `name`, `aliases` and `candidate_indexes`.
-- Candidate indexes must exist and may appear in at most one CharacterGroup. Missing indexes are treated as intentionally filtered candidates.
-- After model filtering, a deterministic exact alias-overlap pass merges any remaining groups with identical names or aliases. The earlier output group's formal name is retained.
-- Structural failure uses deterministic repair and bounded retry. Final failure writes `result: {}` and blocks reconstruction.
+- Candidates with the same trimmed first name are aggregated. Names retain first-seen order and exact duplicate descriptions are removed; no fuzzy or semantic identity merge occurs.
+- The configured total description budget is divided across aggregated characters. Plot text is not sent.
+- Each aggregated character is one independent parallel model item and uses `character_profile.txt` exactly once.
+- Model input is `{"character":{"names":[...],"description":"..."}}`.
+- Model output is `{"profile":{"name":"formal name","content":"profile text"}}`.
+- The selected formal name must occur in input `character.names`; invented names fail validation and retry within the shared attempt budget.
+- The selected name is moved to the first position. Every other supplied name is retained in original order and later becomes a DatasetBundle alias.
+- `profile.content` is the final non-empty profile text; there is no later profile-summary model Stage.
+- Each `character_profiles.jsonl` record identifies the source candidate indexes in `plot_extractions.jsonl`, plus prompt file, provider, model and result.
+- Final failure writes `result: {}` and blocks Plot reconstruction.
 
 ### 15. Character-to-Plot mapping
 
 - Plot reconstruction maps each CharacterCandidate's local `plot_indexes` to final reconstructed Plot indexes.
 - A nullable or unassigned observation is associated with every reconstructed Plot touched by its source TextChunk.
 - Final Plot stores only `character_refs`; it does not copy raw descriptions.
-- Dialogue extraction resolves only CharacterGroups referenced by the current Plot.
-- For each resolved character it supplies formal name, aliases and descriptions relevant to the current Plot, bounded to model context.
-- CharacterProfile `plot_refs` are derived from final Plots influenced by the group's candidate descriptions.
+- Dialogue extraction resolves only generated character profiles referenced by the current Plot.
+- For each resolved character it supplies the reordered names and aggregated description.
+- CharacterProfile `plot_refs` are derived from final Plots influenced by the character's candidate descriptions.
 
 ### 16. Dialogue extraction contract
 
@@ -383,7 +381,7 @@ TextChunk contains exactly the following domain fields:
 - Dialogue extraction receives only current PlotChunk text and current Plot character information. It does not receive previous or next PlotChunk content.
 - Model output contains one ordered `utterances` array. Each item has non-empty `speaker` and `content`.
 - The model is instructed to emit source order, but RAR does not reject, reorder or retry output merely because alignment suggests a different order.
-- Known formal names or aliases are mapped to the CharacterGroup formal name.
+- Known formal names or aliases are mapped to the resolved character's formal name.
 - Unknown and temporary names are preserved as strings and do not automatically become CharacterProfiles.
 - Narration, objective actions and environment use the exact speaker `Environment`.
 - Environment content must remain in the `*(...)*` form in model output, intermediate artifacts and DatasetBundle.
@@ -420,17 +418,10 @@ TextChunk contains exactly the following domain fields:
 - PlotChunk batch boundaries do not need another field because every Utterance already points to its source PlotChunk.
 - If any dialogue Unit has `result: {}`, the dialogue Stage is incomplete and assembly does not produce a final DatasetBundle.
 
-### 19. Character profile generation
+### 19. Final CharacterProfile assembly
 
-- Profile generation starts only after the dialogue Stage is complete.
-- Each CharacterGroup is one independent parallel profile Unit.
-- Full candidate descriptions are collected in Plot order.
-- Exact duplicate descriptions are removed. Conflicting or evolving observations are preserved in narrative order rather than overwritten.
-- Profile generation receives formal name, aliases and descriptions. It does not require full Plot text.
-- If descriptions exceed model context, deterministic batching produces partial summaries which are then summarized hierarchically.
-- Profile output is one non-empty plain-text `profile` value.
-- `character_profiles.jsonl` follows CharacterGroup order. Each line identifies `character_filter.json` plus its index and stores prompt file, provider, model and result.
-- Invalid or empty profile output is retried within the shared attempt budget. Final failure writes `result: {}` and blocks DatasetBundle generation.
+- No model call occurs in this step. Formal name, aliases and profile text already come from Stage 14.
+- After Plot reconstruction, character references are used to derive final `plot_refs` deterministically.
 - CharacterProfile contains only `name`, `aliases`, `profile` and `plot_refs`.
 - No character ID is persisted.
 - Plain-text exports use the character's DatasetBundle index plus a filesystem-safe name to avoid collisions.
@@ -459,7 +450,7 @@ DatasetBundle has the following top-level fields:
 
 ### 21. Prompt components
 
-- Default Prompt files exist for Plot extraction, global character filtering, dialogue extraction and profile generation.
+- Default Prompt files exist for Plot extraction, dialogue extraction and combined formal-name/profile generation.
 - Initial Prompt content may be generated as implementation placeholders and refined independently.
 - Prompt replacement is configured by file.
 - Prompt text is not a persisted business entity and does not alter Workflow recovery semantics.
@@ -552,7 +543,7 @@ DatasetBundle has the following top-level fields:
 - Dialogue tests cover known aliases, temporary speakers, Environment formatting, valid empty output, pure Environment output and malformed output.
 - Dialogue alignment tests cover forward cursor matching, repeated lines, Environment cursor behavior, exact-only short text, fuzzy threshold, failed match preservation and TextChunk span offsets.
 - Conversation assembly tests prove PlotChunk ordering, model-order preservation and one Plot to one Conversation without another model call.
-- Profile tests cover description ordering, exact duplicate removal, contradictions, hierarchical summarization, non-empty validation, parallel completion and resume.
+- Profile tests cover the exact prompt payload, description ordering, duplicate removal, formal-name validation, alias retention, parallel completion and resume.
 - DatasetBundle tests validate the no-ID contract, reference resolution, minimal top-level structure and exclusion of RunArtifacts and runtime metadata.
 - ShareGPT tests cover one Conversation by target character, formal speaker prefixes, full-width colon, Environment prefix, assistant `loss: true`, role merging, trailing-user removal, missing-assistant omission and combined/per-character outputs.
 - Prompt replacement tests prove that different Prompt files do not change persisted Schema or recovery behavior.
@@ -627,4 +618,4 @@ RAR uses Cyrene-Agent as prior art for the generic Harness loop, tool registrati
 
 ### Implementation readiness criterion
 
-The text core is implementation-ready when a local Chat request can bind a Project, resolve an InputManifest, execute and resume the fixed text Workflow, produce every declared artifact, reconstruct Plots, filter characters globally, extract and align Conversations, generate non-empty CharacterProfiles, assemble DatasetBundle, export per-character ShareGPT data, and later accept a generic Agent request that reads or modifies those files and validates the result without invoking a task-specific modification Workflow.
+The text core is implementation-ready when a local Chat request can bind a Project, resolve an InputManifest, execute and resume the fixed text Workflow, produce every declared artifact, aggregate character candidates, select formal names while retaining aliases, generate non-empty CharacterProfiles, reconstruct Plots, extract and align Conversations, assemble DatasetBundle, export per-character ShareGPT data, and later accept a generic Agent request that reads or modifies those files and validates the result without invoking a task-specific modification Workflow.

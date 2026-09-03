@@ -2,21 +2,48 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from pathlib import Path
 
 PROMPT_STAGES = (
     "plot_extraction",
-    "character_filter",
-    "dialogue_extraction",
     "character_profile",
+    "dialogue_extraction",
 )
+PROMPT_SEPARATOR_RE = re.compile(r"^----------$", re.MULTILINE)
+
+
+@dataclass(frozen=True, slots=True)
+class RenderedPrompt:
+    system: str
+    user_prefix: str
 
 
 @dataclass(frozen=True, slots=True)
 class PromptTemplate:
     filename: str
     text: str
+
+    def render(self, replacements: dict[str, str] | None = None) -> RenderedPrompt:
+        """Render placeholders and split an optional RLFF-style user prefix."""
+
+        normalized = self.text.replace("\r\n", "\n").replace("\r", "\n")
+        delimiters = list(PROMPT_SEPARATOR_RE.finditer(normalized))
+        if delimiters:
+            delimiter = delimiters[-1]
+            system = normalized[: delimiter.start()].strip()
+            user_prefix = normalized[delimiter.end() :].strip()
+        else:
+            system = normalized.strip()
+            user_prefix = ""
+        if not system:
+            raise ValueError(f"prompt system section is empty: {self.filename}")
+        for key, value in (replacements or {}).items():
+            placeholder = "{" + key + "}"
+            system = system.replace(placeholder, value)
+            user_prefix = user_prefix.replace(placeholder, value)
+        return RenderedPrompt(system=system, user_prefix=user_prefix)
 
 
 class PromptCatalog:

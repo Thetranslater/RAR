@@ -22,7 +22,6 @@ class DatasetPaths:
     work: Path
     text_chunks: Path
     plot_extractions: Path
-    character_filter: Path
     plots: Path
     dialogue_extractions: Path
     character_profiles: Path
@@ -40,7 +39,6 @@ class DatasetPaths:
             work=work,
             text_chunks=work / "text_chunks.jsonl",
             plot_extractions=work / "plot_extractions.jsonl",
-            character_filter=work / "character_filter.json",
             plots=work / "plots.json",
             dialogue_extractions=work / "dialogue_extractions.jsonl",
             character_profiles=work / "character_profiles.jsonl",

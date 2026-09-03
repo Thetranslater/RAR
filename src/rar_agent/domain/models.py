@@ -5,7 +5,14 @@ from __future__ import annotations
 from pathlib import PurePath, PureWindowsPath
 from typing import Annotated, Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import (
+    AliasChoices,
+    BaseModel,
+    ConfigDict,
+    Field,
+    field_validator,
+    model_validator,
+)
 
 JsonObject = dict[str, Any]
 
@@ -73,7 +80,10 @@ class CharacterRef(DomainModel):
 
 
 class CharacterCandidate(DomainModel):
-    names: Annotated[list[str], Field(min_length=1)]
+    names: Annotated[
+        list[str],
+        Field(min_length=1, validation_alias=AliasChoices("names", "name")),
+    ]
     description: Annotated[str, Field(min_length=1)]
     plot_indexes: list[Annotated[int, Field(ge=0)]] | None = None
 
@@ -85,24 +95,22 @@ class CharacterCandidate(DomainModel):
         return names
 
 
-class CharacterFilterRequestCandidate(DomainModel):
-    candidate_indexes: Annotated[list[int], Field(min_length=1)]
+class CharacterProfileGenerationInput(DomainModel):
     names: Annotated[list[str], Field(min_length=1)]
     description: str
 
 
-class CharacterFilterRequest(DomainModel):
-    characters: list[CharacterFilterRequestCandidate]
+class CharacterProfileGenerationRequest(DomainModel):
+    character: CharacterProfileGenerationInput
 
 
-class CharacterGroup(DomainModel):
+class CharacterProfileSelection(DomainModel):
     name: Annotated[str, Field(min_length=1)]
-    aliases: list[str]
-    candidate_indexes: Annotated[list[int], Field(min_length=1)]
+    content: Annotated[str, Field(min_length=1)]
 
 
-class CharacterFilterResult(DomainModel):
-    characters: list[CharacterGroup]
+class CharacterProfileGenerationResult(DomainModel):
+    profile: CharacterProfileSelection
 
 
 class PlotExtractionResult(DomainModel):

@@ -11,17 +11,18 @@
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
-    "vite": "latest",
-    "typescript": "latest",
+    "lucide-react": "latest",
     "react": "latest",
     "react-dom": "latest",
-    "lucide-react": "latest"
+    "react-router-dom": "^7.18.3",
+    "typescript": "latest",
+    "vite": "latest"
   },
   "devDependencies": {
-    "@types/react": "latest",
-    "@types/react-dom": "latest",
     "@testing-library/react": "latest",
     "@testing-library/user-event": "latest",
+    "@types/react": "latest",
+    "@types/react-dom": "latest",
     "jsdom": "latest",
     "vitest": "latest"
   },

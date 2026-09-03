@@ -56,13 +56,59 @@ async def test_agent_harness_executes_multi_round_workspace_change(tmp_path: Pat
         database=database,
     )
 
-    result = await harness.run("把数据集名称从 old 改成 new。")
+    pending = await harness.run("把数据集名称从 old 改成 new。")
 
+    assert pending.status == "awaiting_approval"
+    assert pending.pending is not None
+    assert pending.approvals[0].tool_name == "replace_text"
+    assert '"old"' in target.read_text(encoding="utf-8")
+    assert [message.role for message in database.list_messages(pending.chat_session)] == [
+        "user"
+    ]
+
+    result = await harness.resume(pending.pending, approved=True)
+
+    assert result.status == "completed"
     assert result.content == "已修改并验证数据集名称。"
     assert result.tool_calls == 1
     assert '"new"' in target.read_text(encoding="utf-8")
     assert client.requests[1].messages[-1].role == "tool"
     assert database.list_tool_calls(result.chat_session)[0].status == "succeeded"
+
+
+async def test_agent_harness_reports_user_denial_to_model(tmp_path: Path) -> None:
+    target = tmp_path / "note.txt"
+    client = ScriptedModelClient(
+        [
+            ModelResponse(
+                tool_calls=[
+                    ToolCall(
+                        call_id="call-write",
+                        name="write_file",
+                        arguments={"path": "note.txt", "content": "content"},
+                    )
+                ]
+            ),
+            "文件未创建。",
+        ]
+    )
+    database = ProjectDatabase(tmp_path)
+    harness = AgentHarness(
+        model_client=client,
+        model="test-model",
+        dispatcher=ToolDispatcher(tmp_path, build_workspace_tools(tmp_path)),
+        database=database,
+    )
+
+    pending = await harness.run("创建 note.txt。")
+    assert pending.pending is not None
+
+    result = await harness.resume(pending.pending, approved=False)
+
+    assert result.content == "文件未创建。"
+    assert target.exists() is False
+    assert database.list_tool_calls(result.chat_session)[0].status == "denied"
+    assert "denied by user" in client.requests[1].messages[-1].content
 
 
 async def test_agent_harness_can_continue_existing_chat(tmp_path: Path) -> None:

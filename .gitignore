@@ -10,6 +10,9 @@ node_modules/
 web/dist/
 *.tsbuildinfo
 datasets/
+data/
+models/
+outputs/
 *.db
 *.sqlite3
 .rar/

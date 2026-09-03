@@ -8,13 +8,14 @@ import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, TypeVar
+from typing import Any, Literal, TypeVar
+from uuid import uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from rar_agent.domain.models import (
-    CharacterFilterResult,
     CharacterProfile,
+    CharacterProfileGenerationResult,
     CharacterRef,
     DatasetBundle,
     DatasetResource,
@@ -26,11 +27,11 @@ from rar_agent.domain.models import (
 )
 from rar_agent.export.sharegpt import ShareGPTExporter, ShareGPTExportReport
 from rar_agent.models.base import ModelClient, ModelMessage, ModelRequest
-from rar_agent.models.scheduler import ModelScheduler
+from rar_agent.models.scheduler import DEFAULT_WORKFLOW_CONCURRENCY, ModelScheduler
 from rar_agent.models.structured import StructuredModelGateway, StructuredOutputError
-from rar_agent.prompts.loader import PromptCatalog
+from rar_agent.prompts.loader import PromptCatalog, PromptTemplate
 from rar_agent.storage.artifacts import DatasetArtifactStore, DatasetPaths
-from rar_agent.text.characters import CharacterResolver
+from rar_agent.text.characters import CharacterResolver, ResolvedCharacter
 from rar_agent.text.chunking import TextChunker, split_sentences
 from rar_agent.text.dialogue import (
     ConversationAssembler,
@@ -42,26 +43,31 @@ from rar_agent.text.plot_rebuilder import PlotRebuilder
 from rar_agent.text.tokenizer import Tokenizer
 
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
-StageCallback = Callable[[str, Path], Awaitable[None]]
+StagePhase = Literal["started", "completed"]
+StageCallback = Callable[[str, StagePhase, Path], Awaitable[None]]
 JsonObject = dict[str, Any]
-CHARACTER_FILTER_PATH = "work/character_filter.json"
+CHARACTER_PROFILES_PATH = "work/character_profiles.jsonl"
+DEBUG_STAGE_UNIT_LIMIT = 5
 _UNSAFE_FILE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
-
-
-class ProfileGenerationResult(BaseModel):
-    profile: str = Field(min_length=1)
+PLOT_OPENING_PLUGIN = (
+    "5. 此次对话提取中第一个对话内容必须是旁白用以开场，要求简短不能过长。"  # noqa: RUF001
+)
 
 
 @dataclass(frozen=True, slots=True)
 class WorkflowConfig:
     model: str
+    debug: bool = False
     text_chunk_tokens: int = 5120
     plot_chunk_tokens: int = 5120
     character_description_budget: int = 24_000
     adjacent_plot_sentences: int = 3
     max_attempts: int = 3
-    max_concurrency: int = 4
-    profile_description_chars: int = 16_000
+    max_concurrency: int = DEFAULT_WORKFLOW_CONCURRENCY
+    volume_splitters: tuple[str, ...] | None = None
+    chapter_splitters: tuple[str, ...] | None = None
+    include_headings: bool = False
+    include_front_matter: bool = False
     stage_models: dict[str, str] = field(default_factory=dict)
     prompt_overrides: dict[str, Path] = field(default_factory=dict)
     sharegpt_system_template: str = (
@@ -74,7 +80,6 @@ class WorkflowConfig:
             "plot_chunk_tokens",
             "max_attempts",
             "max_concurrency",
-            "profile_description_chars",
         ):
             if getattr(self, name) < 1:
                 raise ValueError(f"{name} must be positive")
@@ -120,8 +125,10 @@ class DatasetBuildWorkflow:
         self.gateway = StructuredModelGateway(max_attempts=config.max_attempts)
         self.prompts = PromptCatalog(config.prompt_overrides)
         self.scheduler = scheduler or ModelScheduler(
-            default_limit=config.max_concurrency
+            default_limit=config.max_concurrency,
+            default_workflow_limit=config.max_concurrency,
         )
+        self.scheduler_workload_id = str(uuid4())
 
     async def run(
         self,
@@ -143,40 +150,60 @@ class DatasetBuildWorkflow:
             else:
                 store.write_json(store.paths.input_manifest, manifest.model_dump(mode="json"))
 
+        await self._stage_event("chunk", "started", store.paths.text_chunks)
         chunks = self._load_or_create_chunks(store, manifest)
         await self._stage_complete("chunk", store.paths.text_chunks)
+        chunks = [
+            TextChunk.model_validate(row)
+            for row in store.read_jsonl(store.paths.text_chunks)
+        ]
 
-        plot_results = await self._plot_extraction(store, chunks)
+        workflow_chunks = (
+            chunks[:DEBUG_STAGE_UNIT_LIMIT] if self.config.debug else chunks
+        )
+        await self._stage_event(
+            "plot_extraction", "started", store.paths.plot_extractions
+        )
+        plot_results = await self._plot_extraction(store, workflow_chunks)
         await self._stage_complete("plot_extraction", store.paths.plot_extractions)
+        plot_results = self._read_stage_results(
+            store, store.paths.plot_extractions, PlotExtractionResult
+        )
 
         candidates = [candidate for result in plot_results for candidate in result.characters]
-        character_filter = await self._character_filter(store, candidates)
-        await self._stage_complete("character_filter", store.paths.character_filter)
+        await self._stage_event(
+            "character_profile", "started", store.paths.character_profiles
+        )
+        characters = await self._character_profiles(store, candidates)
+        await self._stage_complete("character_profile", store.paths.character_profiles)
+        characters = self._read_character_profiles(store, candidates)
 
         candidate_refs = {
-            candidate_index: CharacterRef(path=CHARACTER_FILTER_PATH, index=group_index)
-            for group_index, group in enumerate(character_filter.characters)
-            for candidate_index in group.candidate_indexes
+            candidate_index: CharacterRef(path=CHARACTER_PROFILES_PATH, index=group_index)
+            for group_index, character in enumerate(characters)
+            for candidate_index in character.candidate_indexes
         }
+        await self._stage_event("plot_reconstruction", "started", store.paths.plots)
         plots = PlotRebuilder(
             self.tokenizer, target_tokens=self.config.plot_chunk_tokens
-        ).rebuild(chunks, plot_results, candidate_refs)
+        ).rebuild(workflow_chunks, plot_results, candidate_refs)
         store.write_json(store.paths.plots, plots.model_dump(mode="json"))
         await self._stage_complete("plot_reconstruction", store.paths.plots)
+        plots = PlotsDocument.model_validate(store.read_json(store.paths.plots))
 
+        await self._stage_event(
+            "dialogue_extraction", "started", store.paths.dialogue_extractions
+        )
         conversations = await self._dialogue_extraction(
-            store, plots, character_filter, candidates
+            store, plots, characters
         )
         await self._stage_complete(
             "dialogue_extraction", store.paths.dialogue_extractions
         )
+        conversations = self._read_conversations(store, plots, characters)
 
-        profiles = await self._profile_generation(
-            store, plots, character_filter, candidates
-        )
-        await self._stage_complete(
-            "character_profile", store.paths.character_profiles
-        )
+        await self._stage_event("dataset", "started", store.paths.dataset)
+        profiles = self._assemble_profiles(plots, characters)
 
         bundle = DatasetBundle(
             name=manifest.name,
@@ -228,6 +255,10 @@ class DatasetBuildWorkflow:
                     text,
                     target_tokens=self.config.text_chunk_tokens,
                     meta=resource.meta,
+                    volume_splitters=self.config.volume_splitters,
+                    chapter_splitters=self.config.chapter_splitters,
+                    include_heading=self.config.include_headings,
+                    include_front_matter=self.config.include_front_matter,
                 )
             )
         store.write_jsonl(
@@ -258,59 +289,74 @@ class DatasetBuildWorkflow:
             validator_factory=validator,
         )
 
-    async def _character_filter(
+    async def _character_profiles(
         self,
         store: DatasetArtifactStore,
         candidates: list[Any],
-    ) -> CharacterFilterResult:
+    ) -> list[ResolvedCharacter]:
         resolver = CharacterResolver()
-        request_value = resolver.build_request(
+        jobs = resolver.build_jobs(
             candidates,
             description_budget=self.config.character_description_budget,
         )
-        input_locator = {"path": "work/plot_extractions.jsonl"}
-        if store.paths.character_filter.exists():
-            record = store.read_json(store.paths.character_filter)
-            if record.get("input") != input_locator:
-                raise ValueError("character_filter.json input mismatch")
-            if record.get("result") != {}:
-                return resolver.resolve(
-                    candidates,
-                    CharacterFilterResult.model_validate(record["result"]),
-                )
+        inputs = [
+            {
+                "path": "work/plot_extractions.jsonl",
+                "candidate_indexes": list(job.candidate_indexes),
+            }
+            for job in jobs
+        ]
 
-        prompt = self.prompts.load("character_filter")
-        record = self._record(
-            input_locator,
-            prompt.filename,
-            {},
-            model=self.config.stage_models.get("character_filter", self.config.model),
+        def validator(
+            index: int,
+        ) -> Callable[
+            [CharacterProfileGenerationResult], CharacterProfileGenerationResult
+        ]:
+            def validate(
+                value: CharacterProfileGenerationResult,
+            ) -> CharacterProfileGenerationResult:
+                resolver.resolve([jobs[index]], [value])
+                return value
+
+            return validate
+
+        generated = await self._run_jsonl_stage(
+            store,
+            stage="character_profile",
+            path=store.paths.character_profiles,
+            inputs=inputs,
+            payloads=[job.request.model_dump(mode="json") for job in jobs],
+            schema=CharacterProfileGenerationResult,
+            validator_factory=validator,
         )
-        store.write_json(store.paths.character_filter, record)
-        try:
-            value = await self._generate(
-                "character_filter",
-                prompt.text,
-                request_value.model_dump(mode="json"),
-                CharacterFilterResult,
-                validator=lambda result: resolver.resolve(candidates, result),
-            )
-            record["result"] = value.model_dump(mode="json")
-        except StructuredOutputError:
-            record["result"] = {}
-        store.write_json(store.paths.character_filter, record)
-        if record["result"] == {}:
-            raise IncompleteStageError("character_filter", store.root, [0])
-        return CharacterFilterResult.model_validate(record["result"])
+        return resolver.resolve(jobs, generated)
+
+    def _read_character_profiles(
+        self,
+        store: DatasetArtifactStore,
+        candidates: list[Any],
+    ) -> list[ResolvedCharacter]:
+        resolver = CharacterResolver()
+        jobs = resolver.build_jobs(
+            candidates,
+            description_budget=self.config.character_description_budget,
+        )
+        generated = self._read_stage_results(
+            store,
+            store.paths.character_profiles,
+            CharacterProfileGenerationResult,
+        )
+        return resolver.resolve(jobs, generated)
 
     async def _dialogue_extraction(
         self,
         store: DatasetArtifactStore,
         plots: PlotsDocument,
-        character_filter: CharacterFilterResult,
-        candidates: list[Any],
+        characters: list[ResolvedCharacter],
     ) -> list[Any]:
         units = [(plot, chunk) for plot in plots.plots for chunk in plot.chunks]
+        if self.config.debug:
+            units = units[:DEBUG_STAGE_UNIT_LIMIT]
         inputs = [
             {
                 "path": "work/plots.json",
@@ -321,10 +367,8 @@ class DatasetBuildWorkflow:
         ]
         payloads = [
             {
-                "plot_chunk": chunk.text,
-                "characters": self._plot_characters(
-                    plot.character_refs, character_filter, candidates
-                ),
+                "input": chunk.text,
+                "characters": self._plot_characters(plot.character_refs, characters),
             }
             for plot, chunk in units
         ]
@@ -335,10 +379,43 @@ class DatasetBuildWorkflow:
             inputs=inputs,
             payloads=payloads,
             schema=DialogueExtractionResult,
+            prompt_replacements=[
+                {
+                    "plugin_a": PLOT_OPENING_PLUGIN
+                    if chunk.index == 0
+                    else ""
+                }
+                for _, chunk in units
+            ],
         )
+        return self._assemble_conversations(units, results, plots, characters)
+
+    def _read_conversations(
+        self,
+        store: DatasetArtifactStore,
+        plots: PlotsDocument,
+        characters: list[ResolvedCharacter],
+    ) -> list[Any]:
+        units = [(plot, chunk) for plot in plots.plots for chunk in plot.chunks]
+        if self.config.debug:
+            units = units[:DEBUG_STAGE_UNIT_LIMIT]
+        results = self._read_stage_results(
+            store,
+            store.paths.dialogue_extractions,
+            DialogueExtractionResult,
+        )
+        return self._assemble_conversations(units, results, plots, characters)
+
+    @staticmethod
+    def _assemble_conversations(
+        units: list[Any],
+        results: list[DialogueExtractionResult],
+        plots: PlotsDocument,
+        characters: list[ResolvedCharacter],
+    ) -> list[Any]:
         aliases = {
             alias: group.name
-            for group in character_filter.characters
+            for group in characters
             for alias in [group.name, *group.aliases]
         }
         aligner = DialogueAligner()
@@ -352,68 +429,48 @@ class DatasetBuildWorkflow:
             )
             batches_by_plot.setdefault(plot.index, []).append(batch)
         assembler = ConversationAssembler()
+        processed_plots = {plot.index for plot, _ in units}
         return [
             assembler.assemble(plot, batches_by_plot.get(plot.index, []))
             for plot in plots.plots
+            if plot.index in processed_plots
         ]
 
-    async def _profile_generation(
-        self,
+    @staticmethod
+    def _read_stage_results(
         store: DatasetArtifactStore,
+        path: Path,
+        schema: type[SchemaT],
+    ) -> list[SchemaT]:
+        results: list[SchemaT] = []
+        for index, record in enumerate(store.read_jsonl(path)):
+            result = record.get("result")
+            if result == {}:
+                raise ValueError(f"{path.name} result is empty at index {index}")
+            results.append(schema.model_validate(result))
+        return results
+
+    @staticmethod
+    def _assemble_profiles(
         plots: PlotsDocument,
-        character_filter: CharacterFilterResult,
-        candidates: list[Any],
+        characters: list[ResolvedCharacter],
     ) -> list[CharacterProfile]:
-        inputs = [
-            {"path": CHARACTER_FILTER_PATH, "index": index}
-            for index in range(len(character_filter.characters))
-        ]
-        descriptions = [
-            list(
-                dict.fromkeys(
-                    candidates[index].description for index in group.candidate_indexes
-                )
-            )
-            for group in character_filter.characters
-        ]
-        payloads = [
-            {
-                "name": group.name,
-                "aliases": group.aliases,
-                "descriptions": value,
-            }
-            for group, value in zip(
-                character_filter.characters, descriptions, strict=True
-            )
-        ]
-        generated = await self._run_jsonl_stage(
-            store,
-            stage="character_profile",
-            path=store.paths.character_profiles,
-            inputs=inputs,
-            payloads=payloads,
-            schema=ProfileGenerationResult,
-            custom_generator=lambda index: self._generate_profile(
-                character_filter.characters[index].name,
-                character_filter.characters[index].aliases,
-                descriptions[index],
-            ),
-        )
         return [
             CharacterProfile(
-                name=group.name,
-                aliases=group.aliases,
-                profile=result.profile,
+                name=character.name,
+                aliases=character.aliases,
+                profile=character.profile,
                 plot_refs=[
                     PlotRef(path="work/plots.json", index=plot.index)
                     for plot in plots.plots
-                    if CharacterRef(path=CHARACTER_FILTER_PATH, index=group_index)
+                    if CharacterRef(
+                        path=CHARACTER_PROFILES_PATH,
+                        index=character_index,
+                    )
                     in plot.character_refs
                 ],
             )
-            for group_index, (group, result) in enumerate(
-                zip(character_filter.characters, generated, strict=True)
-            )
+            for character_index, character in enumerate(characters)
         ]
 
     async def _run_jsonl_stage(
@@ -430,9 +487,12 @@ class DatasetBuildWorkflow:
         ]
         | None = None,
         custom_generator: Callable[[int], Awaitable[SchemaT]] | None = None,
+        prompt_replacements: list[dict[str, str]] | None = None,
     ) -> list[SchemaT]:
         if len(inputs) != len(payloads):
             raise ValueError("stage inputs and payloads must have equal length")
+        if prompt_replacements is not None and len(prompt_replacements) != len(inputs):
+            raise ValueError("prompt replacements and inputs must have equal length")
         prompt = self.prompts.load(stage)
         existing = store.read_jsonl(path)
         if len(existing) > len(inputs):
@@ -475,12 +535,17 @@ class DatasetBuildWorkflow:
                 else:
                     value = await self._generate(
                         stage,
-                        prompt.text,
+                        prompt,
                         payloads[index],
                         schema,
                         validator=(
                             validator_factory(index)
                             if validator_factory is not None
+                            else None
+                        ),
+                        replacements=(
+                            prompt_replacements[index]
+                            if prompt_replacements is not None
                             else None
                         ),
                     )
@@ -501,19 +566,32 @@ class DatasetBuildWorkflow:
     async def _generate(
         self,
         stage: str,
-        system_prompt: str,
+        prompt: PromptTemplate,
         payload: JsonObject,
         schema: type[SchemaT],
         validator: Callable[[SchemaT], SchemaT] | None = None,
+        replacements: dict[str, str] | None = None,
     ) -> SchemaT:
+        render_values: dict[str, str] = {}
+        if stage == "plot_extraction":
+            render_values["k"] = str(self.config.adjacent_plot_sentences)
+        elif stage == "dialogue_extraction":
+            render_values["plugin_a"] = ""
+        render_values.update(replacements or {})
+        rendered_prompt = prompt.render(render_values)
+        serialized_payload = json.dumps(
+            payload, ensure_ascii=False, separators=(",", ":")
+        )
+        user_content = (
+            f"{rendered_prompt.user_prefix}\n{serialized_payload}"
+            if rendered_prompt.user_prefix
+            else serialized_payload
+        )
         request = ModelRequest(
             model=self.config.stage_models.get(stage, self.config.model),
             messages=[
-                ModelMessage(role="system", content=system_prompt),
-                ModelMessage(
-                    role="user",
-                    content=json.dumps(payload, ensure_ascii=False, separators=(",", ":")),
-                ),
+                ModelMessage(role="system", content=rendered_prompt.system),
+                ModelMessage(role="user", content=user_content),
             ],
             temperature=0,
         )
@@ -523,77 +601,9 @@ class DatasetBuildWorkflow:
             schema,
             validator=validator,
             scheduler=self.scheduler,
+            workload_id=self.scheduler_workload_id,
+            workload_limit=self.config.max_concurrency,
         )
-
-    async def _generate_profile(
-        self,
-        name: str,
-        aliases: list[str],
-        descriptions: list[str],
-    ) -> ProfileGenerationResult:
-        prompt = self.prompts.load("character_profile")
-        batches = self._description_batches(
-            descriptions, self.config.profile_description_chars
-        )
-        if len(batches) == 1:
-            return await self._generate(
-                "character_profile",
-                prompt.text,
-                {"name": name, "aliases": aliases, "descriptions": batches[0]},
-                ProfileGenerationResult,
-            )
-        partials = await asyncio.gather(
-            *(
-                self._generate(
-                    "character_profile",
-                    prompt.text,
-                    {
-                        "mode": "partial",
-                        "name": name,
-                        "aliases": aliases,
-                        "descriptions": batch,
-                    },
-                    ProfileGenerationResult,
-                )
-                for batch in batches
-            )
-        )
-        return await self._generate(
-            "character_profile",
-            prompt.text,
-            {
-                "mode": "final",
-                "name": name,
-                "aliases": aliases,
-                "partial_profiles": [value.profile for value in partials],
-            },
-            ProfileGenerationResult,
-        )
-
-    @staticmethod
-    def _description_batches(
-        descriptions: list[str], limit: int
-    ) -> list[list[str]]:
-        pieces = [
-            description[start : start + limit]
-            for description in descriptions
-            for start in range(0, len(description), limit)
-        ]
-        if not pieces:
-            return [[]]
-        batches: list[list[str]] = []
-        current: list[str] = []
-        size = 0
-        for piece in pieces:
-            if current and size + len(piece) > limit:
-                batches.append(current)
-                current = []
-                size = 0
-            current.append(piece)
-            size += len(piece)
-        if current:
-            batches.append(current)
-        return batches
 
     def _plot_payload(self, chunks: list[TextChunk], index: int) -> JsonObject:
         current = chunks[index]
@@ -604,7 +614,7 @@ class DatasetBuildWorkflow:
             previous = "".join(split_sentences(chunks[index - 1].text)[-count:])
         if count and index + 1 < len(chunks) and chunks[index + 1].meta == current.meta:
             following = "".join(split_sentences(chunks[index + 1].text)[:count])
-        return {"previous": previous, "current": current.text, "next": following}
+        return {"input": current.text, "previous": previous, "next": following}
 
     @staticmethod
     def _validate_plot_result(
@@ -634,20 +644,15 @@ class DatasetBuildWorkflow:
     @staticmethod
     def _plot_characters(
         refs: list[CharacterRef],
-        character_filter: CharacterFilterResult,
-        candidates: list[Any],
+        characters: list[ResolvedCharacter],
     ) -> list[JsonObject]:
         values: list[JsonObject] = []
         for ref in refs:
-            group = character_filter.characters[ref.index]
+            character = characters[ref.index]
             values.append(
                 {
-                    "name": group.name,
-                    "aliases": group.aliases,
-                    "descriptions": [
-                        candidates[index].description
-                        for index in group.candidate_indexes
-                    ],
+                    "names": list(character.names),
+                    "description": character.description,
                 }
             )
         return values
@@ -669,8 +674,13 @@ class DatasetBuildWorkflow:
         }
 
     async def _stage_complete(self, stage: str, artifact: Path) -> None:
+        await self._stage_event(stage, "completed", artifact)
+
+    async def _stage_event(
+        self, stage: str, phase: StagePhase, artifact: Path
+    ) -> None:
         if self.stage_callback is not None:
-            await self.stage_callback(stage, artifact)
+            await self.stage_callback(stage, phase, artifact)
 
     @staticmethod
     def _workspace_file(project_root: Path, relative_path: str) -> Path:

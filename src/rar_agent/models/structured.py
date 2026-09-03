@@ -34,12 +34,20 @@ class StructuredModelGateway:
         *,
         validator: Callable[[SchemaT], SchemaT] | None = None,
         scheduler: ModelScheduler | None = None,
+        workload_id: str | None = None,
+        workload_limit: int | None = None,
     ) -> SchemaT:
         last_error: Exception | None = None
         for _ in range(self.max_attempts):
             try:
                 response = (
-                    await scheduler.complete(client, request)
+                    await scheduler.complete(
+                        client,
+                        request,
+                        workload="workflow",
+                        workload_id=workload_id,
+                        workload_limit=workload_limit,
+                    )
                     if scheduler is not None
                     else await client.complete(request)
                 )
