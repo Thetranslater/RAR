@@ -8,7 +8,13 @@ from pathlib import Path, PurePath, PureWindowsPath
 
 from PIL import Image, UnidentifiedImageError
 
-from rar_agent.workflow.manga.models import ImageBatch, ImagePage, MangaScan
+from rar_agent.workflow.manga.models import (
+    ImageBatch,
+    ImagePage,
+    MangaPreview,
+    MangaPreviewIssue,
+    MangaScan,
+)
 
 SUPPORTED_IMAGE_SUFFIXES = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 _DIGITS = re.compile(r"(\d+)")
@@ -68,6 +74,59 @@ def scan_manga_folder(
     )
 
 
+def preview_manga_folder(
+    project_root: Path,
+    resource_path: str,
+    *,
+    batch_size: int = 5,
+) -> MangaPreview:
+    if not 1 <= batch_size <= 10:
+        raise MangaScanError("batch_size must be between 1 and 10")
+    normalized = _relative_path(resource_path)
+    project = project_root.resolve()
+    resource = (project / normalized).resolve()
+    try:
+        resource.relative_to(project)
+    except ValueError as error:
+        raise MangaScanError("resource path must be workspace-relative") from error
+    if not resource.is_dir():
+        raise MangaScanError(f"manga resource is not a directory: {normalized}")
+
+    skipped: list[MangaPreviewIssue] = []
+    image_paths = _discover_images(resource, skipped=skipped, project_root=project)
+    image_paths.sort(key=lambda value: _natural_key(value.relative_to(resource)))
+    valid_paths: list[Path] = []
+    errors: list[MangaPreviewIssue] = []
+    for image_path in image_paths:
+        try:
+            _validate_image(image_path, project)
+        except MangaScanError as error:
+            errors.append(
+                MangaPreviewIssue(
+                    path=image_path.relative_to(project).as_posix(),
+                    reason=str(error),
+                )
+            )
+        else:
+            valid_paths.append(image_path)
+    pages = [
+        ImagePage(
+            page_index=index,
+            path=image_path.relative_to(project).as_posix(),
+            meta={"directory": _directory_meta(image_path.parent, resource)},
+        )
+        for index, image_path in enumerate(valid_paths)
+    ]
+    return MangaPreview(
+        path=normalized,
+        image_count=len(pages),
+        batch_count=len(_build_batches(pages, batch_size)),
+        first_paths=[page.path for page in pages[:10]],
+        skipped=skipped,
+        errors=errors,
+    )
+
+
 def _relative_path(value: str) -> str:
     normalized = value.replace("\\", "/").strip()
     if (
@@ -80,25 +139,51 @@ def _relative_path(value: str) -> str:
     return normalized
 
 
-def _discover_images(resource: Path) -> list[Path]:
+def _discover_images(
+    resource: Path,
+    *,
+    skipped: list[MangaPreviewIssue] | None = None,
+    project_root: Path | None = None,
+) -> list[Path]:
     values: list[Path] = []
     for root, directories, filenames in os.walk(resource, followlinks=False):
         root_path = Path(root)
-        directories[:] = [
-            name
-            for name in directories
-            if not name.startswith(".")
-            and name != "__MACOSX"
-            and not (root_path / name).is_symlink()
-        ]
+        kept_directories: list[str] = []
+        for name in directories:
+            candidate = root_path / name
+            reason = None
+            if name.startswith(".") or name == "__MACOSX":
+                reason = "hidden or metadata directory"
+            elif candidate.is_symlink():
+                reason = "symbolic link"
+            if reason is None:
+                kept_directories.append(name)
+            elif skipped is not None and project_root is not None:
+                skipped.append(
+                    MangaPreviewIssue(
+                        path=candidate.relative_to(project_root).as_posix(),
+                        reason=reason,
+                    )
+                )
+        directories[:] = kept_directories
         for name in filenames:
             candidate = root_path / name
-            if (
-                not name.startswith(".")
-                and candidate.suffix.lower() in SUPPORTED_IMAGE_SUFFIXES
-                and not candidate.is_symlink()
-            ):
+            reason = None
+            if name.startswith("."):
+                reason = "hidden file"
+            elif candidate.is_symlink():
+                reason = "symbolic link"
+            elif candidate.suffix.lower() not in SUPPORTED_IMAGE_SUFFIXES:
+                reason = "unsupported file type"
+            if reason is None:
                 values.append(candidate)
+            elif skipped is not None and project_root is not None:
+                skipped.append(
+                    MangaPreviewIssue(
+                        path=candidate.relative_to(project_root).as_posix(),
+                        reason=reason,
+                    )
+                )
     return values
 
 

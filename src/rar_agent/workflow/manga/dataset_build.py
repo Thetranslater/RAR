@@ -89,6 +89,8 @@ class OcrRunner(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class MangaWorkflowConfig:
+    vision_provider: str | None = None
+    text_provider: str | None = None
     vision_model: str = "qwen3.7-flash"
     text_model: str = "deepseek-chat"
     debug: bool = False
@@ -250,7 +252,20 @@ class MangaDatasetBuildWorkflow:
         paths = MangaPaths.from_store(store)
         paths.work.mkdir(parents=True, exist_ok=True)
         paths.report.parent.mkdir(parents=True, exist_ok=True)
-        if not paths.workflow_config.exists():
+        if paths.workflow_config.exists():
+            self.config = self._read_workflow_config(store, paths)
+            self.prompts = PromptCatalog(self.config.prompt_overrides)
+            if (
+                self.config.vision_provider is not None
+                and self.config.vision_provider != self.vision_model_client.provider
+            ):
+                raise ValueError("resume requires the persisted vision provider")
+            if (
+                self.config.text_provider is not None
+                and self.config.text_provider != self.text_model_client.provider
+            ):
+                raise ValueError("resume requires the persisted text provider")
+        else:
             store.write_json(paths.workflow_config, self.config.persisted())
 
         await self._stage_event("image_scan", "started", paths.image_pages)
@@ -451,6 +466,18 @@ class MangaDatasetBuildWorkflow:
         )
         return MangaDatasetBuildResult(store.root, paths, bundle, plots, export_report)
 
+    @staticmethod
+    def _read_workflow_config(
+        store: DatasetArtifactStore,
+        paths: MangaPaths,
+    ) -> MangaWorkflowConfig:
+        value = store.read_json(paths.workflow_config)
+        overrides = value.get("prompt_overrides", {})
+        value["prompt_overrides"] = {
+            name: Path(path) for name, path in overrides.items()
+        }
+        return MangaWorkflowConfig(**value)
+
     def _load_or_scan(
         self,
         store: DatasetArtifactStore,
@@ -595,7 +622,11 @@ class MangaDatasetBuildWorkflow:
                 batch_size=self.config.ocr_batch_size,
             )
             existing.update((result.page_index, result) for result in generated)
-            ordered = [existing[page.page_index] for page in scan.pages if page.page_index in existing]
+            ordered = [
+                existing[page.page_index]
+                for page in scan.pages
+                if page.page_index in existing
+            ]
             store.write_jsonl(
                 paths.ocr_results,
                 [page.model_dump(mode="json") for page in ordered],
@@ -926,8 +957,7 @@ class MangaDatasetBuildWorkflow:
         for index, input_value in enumerate(inputs):
             if index < len(existing):
                 record = existing[index]
-                if record.get("input") != input_value:
-                    raise ValueError(f"{path.name} input mismatch at index {index}")
+                record["input"] = input_value
                 try:
                     if record.get("result") == {}:
                         raise ValueError("empty result")

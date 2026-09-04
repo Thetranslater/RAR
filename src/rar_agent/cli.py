@@ -150,6 +150,8 @@ def extract_manga(
             text_model_client=text_client,
             tokenizer=TikTokenTokenizer(),
             config=MangaWorkflowConfig(
+                vision_provider=vision_client.provider,
+                text_provider=text_client.provider,
                 vision_model=vision_model,
                 text_model=text_model,
                 debug=debug,

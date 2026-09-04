@@ -47,7 +47,7 @@ from rar_agent.workflow.manga.ocr_runtime import (
     OcrCapability,
     PaddleOcrWorkerManager,
 )
-from rar_agent.workflow.manga.scanning import MangaScanError, scan_manga_folder
+from rar_agent.workflow.manga.scanning import MangaScanError, preview_manga_folder
 
 ChatRunStatus = Literal[
     "queued",
@@ -593,6 +593,8 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                         text_model_client=model_client,
                         tokenizer=runtime.tokenizer,
                         config=MangaWorkflowConfig(
+                            vision_provider=vision_client.provider,
+                            text_provider=model_client.provider,
                             vision_model=request.vision_model,
                             text_model=request.text_model or runtime.model,
                             debug=request.debug,
@@ -752,25 +754,16 @@ def create_app(runtime: AppRuntime) -> FastAPI:
     async def preview_manga_resource(
         path: str = Query(min_length=1),
         batch_size: int = Query(default=5, ge=1, le=10),
-        debug: bool = False,
     ) -> dict[str, Any]:
         try:
-            scan = scan_manga_folder(
+            preview = preview_manga_folder(
                 runtime.project_root,
                 path,
                 batch_size=batch_size,
-                max_batches=5 if debug else None,
             )
         except MangaScanError as error:
             raise HTTPException(422, str(error)) from error
-        return {
-            "path": scan.resource_path,
-            "image_count": len(scan.pages),
-            "batch_count": len(scan.batches),
-            "first_paths": [page.path for page in scan.pages[:10]],
-            "skipped": [],
-            "errors": [],
-        }
+        return preview.model_dump(mode="json")
 
     @app.get("/api/chats", response_model=list[ChatSummaryResponse])
     async def chats(archived: bool = False) -> list[ChatSummaryResponse]:

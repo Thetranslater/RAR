@@ -12,7 +12,11 @@ from rar_agent.workflow.manga.ocr_runtime import (
     PaddleOcrWorkerManager,
     probe_paddleocr,
 )
-from rar_agent.workflow.manga.scanning import MangaScanError, scan_manga_folder
+from rar_agent.workflow.manga.scanning import (
+    MangaScanError,
+    preview_manga_folder,
+    scan_manga_folder,
+)
 
 __all__ = [
     "ImageBatch",
@@ -25,6 +29,7 @@ __all__ = [
     "MangaWorkflowConfig",
     "OcrCapability",
     "PaddleOcrWorkerManager",
+    "preview_manga_folder",
     "probe_paddleocr",
     "scan_manga_folder",
 ]

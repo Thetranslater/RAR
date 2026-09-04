@@ -3,7 +3,11 @@ from pathlib import Path
 import pytest
 from PIL import Image
 
-from rar_agent.workflow.manga.scanning import MangaScanError, scan_manga_folder
+from rar_agent.workflow.manga.scanning import (
+    MangaScanError,
+    preview_manga_folder,
+    scan_manga_folder,
+)
 
 
 def _image(path: Path, *, color: str = "white") -> None:
@@ -68,3 +72,19 @@ def test_scan_manga_folder_can_limit_debug_to_five_batches(tmp_path: Path) -> No
 
     assert len(scan.batches) == 5
     assert [page.page_index for page in scan.pages] == list(range(10))
+
+
+def test_preview_reports_skipped_and_corrupt_files_without_failing(tmp_path: Path) -> None:
+    _image(tmp_path / "manga" / "2.jpg")
+    (tmp_path / "manga" / "notes.txt").write_text("ignore", encoding="utf-8")
+    (tmp_path / "manga" / "3.png").write_bytes(b"corrupt")
+
+    preview = preview_manga_folder(tmp_path, "manga")
+
+    assert preview.image_count == 1
+    assert preview.first_paths == ["manga/2.jpg"]
+    assert [(item.path, item.reason) for item in preview.skipped] == [
+        ("manga/notes.txt", "unsupported file type")
+    ]
+    assert preview.errors[0].path == "manga/3.png"
+    assert "cannot be decoded" in preview.errors[0].reason

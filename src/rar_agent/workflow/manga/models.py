@@ -69,6 +69,20 @@ class MangaScan(MangaModel):
         return self
 
 
+class MangaPreviewIssue(MangaModel):
+    path: str
+    reason: str
+
+
+class MangaPreview(MangaModel):
+    path: str
+    image_count: int = Field(ge=0)
+    batch_count: int = Field(ge=0)
+    first_paths: list[str]
+    skipped: list[MangaPreviewIssue]
+    errors: list[MangaPreviewIssue]
+
+
 IndexValue = int | str
 
 
