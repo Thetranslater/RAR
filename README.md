@@ -13,9 +13,6 @@ RAR combines two execution paths behind one chat interface:
   through workspace-contained tools. It does not create a dedicated workflow class for
   every task.
 
-The authoritative implementation specification is in
-`doc/design/2026-09-01-rar-agent-text-core-implementation-spec.md`.
-
 ## Current V1 capabilities
 
 - UTF-8 text files and ordered multi-resource InputManifests, with volume/chapter-aware
