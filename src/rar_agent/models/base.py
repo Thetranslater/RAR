@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal, Protocol
+from pathlib import PurePath, PureWindowsPath
+from typing import Annotated, Any, Literal, Protocol
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 JsonObject = dict[str, Any]
 
@@ -25,9 +26,38 @@ class ToolCall(ModelContract):
     arguments: JsonObject
 
 
+def _workspace_relative_path(value: str) -> str:
+    normalized = value.replace("\\", "/").strip()
+    if not normalized:
+        raise ValueError("path must not be empty")
+    if PurePath(normalized).is_absolute() or PureWindowsPath(normalized).is_absolute():
+        raise ValueError("path must be workspace-relative")
+    if ".." in PurePath(normalized).parts:
+        raise ValueError("path must be workspace-relative")
+    return normalized
+
+
+class TextContent(ModelContract):
+    type: Literal["text"] = "text"
+    text: str
+
+
+class LocalImageContent(ModelContract):
+    type: Literal["local_image"] = "local_image"
+    path: str
+
+    _validate_path = field_validator("path")(_workspace_relative_path)
+
+
+ModelContent = Annotated[
+    TextContent | LocalImageContent,
+    Field(discriminator="type"),
+]
+
+
 class ModelMessage(ModelContract):
     role: Literal["system", "user", "assistant", "tool"]
-    content: str | None = None
+    content: str | list[ModelContent] | None = None
     name: str | None = None
     tool_call_id: str | None = None
     tool_calls: list[ToolCall] = Field(default_factory=list)
@@ -36,6 +66,7 @@ class ModelMessage(ModelContract):
 class ModelUsage(ModelContract):
     prompt_tokens: int = Field(default=0, ge=0)
     completion_tokens: int = Field(default=0, ge=0)
+    reasoning_tokens: int = Field(default=0, ge=0)
 
 
 class ModelRequest(ModelContract):

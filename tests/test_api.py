@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any
 
 from fastapi.testclient import TestClient
+from PIL import Image
 
 from rar_agent.api.app import AppRuntime, create_app
 from rar_agent.models.base import ModelRequest, ModelResponse, ToolCall
@@ -166,6 +167,102 @@ def test_api_exposes_project_and_background_chat(tmp_path: Path) -> None:
     assert extraction_tool.parameters["properties"]["debug"]["default"] is False
 
 
+def test_api_previews_and_runs_manga_workflow(tmp_path: Path) -> None:
+    pages = tmp_path / "resources" / "manga"
+    pages.mkdir(parents=True)
+    Image.new("RGB", (8, 8), "white").save(pages / "1.jpg")
+    Image.new("RGB", (8, 8), "black").save(pages / "2.jpg")
+    vision = ScriptedModelClient(
+        [
+            json.dumps(
+                {
+                    "utterances": [
+                        {"page_index": 0, "speaker": 0, "content": "Hi"}
+                    ],
+                    "characters": [
+                        {"index": 0, "names": ["Alice"], "description": "dark hair"}
+                    ],
+                    "chapter_starts": [{"page_index": 0, "title": "Chapter 1"}],
+                    "plot": "Alice greets someone.",
+                }
+            )
+        ],
+        provider="qwen",
+    )
+    text = ScriptedModelClient(
+        [
+            json.dumps(
+                {
+                    "characters": [
+                        {"name": "Alice", "aliases": [], "description": "dark hair"}
+                    ]
+                }
+            ),
+            json.dumps(
+                {
+                    "assignments": [
+                        {
+                            "batch_index": 0,
+                            "local_character_index": 0,
+                            "name": "Alice",
+                        }
+                    ]
+                }
+            ),
+            json.dumps(
+                {"utterances": [{"speaker": "Alice", "content": "Hi"}]}
+            ),
+            json.dumps({"profile": "A dark-haired character."}),
+        ]
+    )
+    runtime = AppRuntime(
+        project_root=tmp_path,
+        model_client=text,
+        model="text-model",
+        tokenizer=CharacterTokenizer(),
+        vision_model_client=vision,
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        models = client.get("/api/models")
+        preview = client.get(
+            "/api/resources/manga/preview",
+            params={"path": "resources/manga"},
+        )
+        accepted = client.post(
+            "/api/extractions",
+            json={
+                "workflow_type": "manga",
+                "manifest": {
+                    "name": "Manga API",
+                    "meta": {},
+                    "resources": [
+                        {
+                            "path": "resources/manga",
+                            "resource_type": "manga",
+                            "display_name": "Volume 1",
+                            "narrative_order": 0,
+                            "meta": {},
+                        }
+                    ],
+                },
+            },
+        )
+        completed = _wait_extraction(
+            client,
+            accepted.json()["task"],
+            status="completed",
+        )
+
+    assert models.status_code == 200
+    assert any(item["capabilities"] == ["text", "vision"] for item in models.json())
+    assert preview.json()["image_count"] == 2
+    assert preview.json()["first_paths"] == [
+        "resources/manga/1.jpg",
+        "resources/manga/2.jpg",
+    ]
+    dataset = tmp_path / completed["dataset_root"] / "dataset.json"
+    assert json.loads(dataset.read_text(encoding="utf-8"))["name"] == "Manga API"
 def test_api_returns_graceful_result_at_agent_round_limit(tmp_path: Path) -> None:
     responses = [
         ModelResponse(

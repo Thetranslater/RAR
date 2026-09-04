@@ -1,10 +1,16 @@
 import json
+from pathlib import Path
 
 import httpx
 import pytest
 from pydantic import BaseModel
 
-from rar_agent.models.base import ModelMessage, ModelRequest
+from rar_agent.models.base import (
+    LocalImageContent,
+    ModelMessage,
+    ModelRequest,
+    TextContent,
+)
 from rar_agent.models.openai_compatible import OpenAICompatibleClient
 from rar_agent.models.scripted import ScriptedModelClient
 from rar_agent.models.structured import StructuredModelGateway, StructuredOutputError
@@ -87,3 +93,86 @@ async def test_openai_compatible_adapter_preserves_provider_payload() -> None:
     assert captured["temperature"] == 0.2
     assert response.content == '{"value": 3}'
     assert response.usage.prompt_tokens == 4
+
+
+async def test_openai_compatible_adapter_sends_project_images_as_data_urls(
+    tmp_path: Path,
+) -> None:
+    image = tmp_path / "pages" / "page-1.jpg"
+    image.parent.mkdir()
+    image.write_bytes(b"\xff\xd8\xff")
+    captured: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "content": '{"value": 3}',
+                            "reasoning_content": "discard me",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 7,
+                    "completion_tokens_details": {"reasoning_tokens": 4},
+                },
+            },
+        )
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http_client:
+        client = OpenAICompatibleClient(
+            provider="qwen",
+            base_url="https://example.invalid/v1",
+            api_key="secret",
+            project_root=tmp_path,
+            http_client=http_client,
+        )
+        response = await client.complete(
+            ModelRequest(
+                model="qwen3.7-flash",
+                messages=[
+                    ModelMessage(
+                        role="user",
+                        content=[
+                            TextContent(text="Page 0"),
+                            LocalImageContent(path="pages/page-1.jpg"),
+                        ],
+                    )
+                ],
+                provider_options={
+                    "top_p": 0.9,
+                    "enable_thinking": True,
+                    "reasoning_effort": "medium",
+                    "max_completion_tokens": 16_384,
+                },
+            )
+        )
+
+    assert captured["messages"] == [
+        {
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "Page 0"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,/9j/"},
+                },
+            ],
+        }
+    ]
+    assert captured["enable_thinking"] is True
+    assert captured["reasoning_effort"] == "medium"
+    assert response.content == '{"value": 3}'
+    assert response.finish_reason == "stop"
+    assert response.usage.reasoning_tokens == 4
+
+
+def test_local_image_content_rejects_paths_outside_the_project_contract() -> None:
+    with pytest.raises(ValueError, match="workspace-relative"):
+        LocalImageContent(path="../secret.jpg")

@@ -1,0 +1,3 @@
+你负责把漫画批次内的局部人物映射到给定角色名称参考表。只输出一个 JSON 对象，不要输出 Markdown 或解释。
+
+输出字段为 assignments。每个输入局部人物必须恰好输出一次，保留 batch_index 和 local_character_index。name 只能是参考表中的正式名称、可唯一识别的别名或 null。无法确定时必须使用 null，不要创造新角色名称。

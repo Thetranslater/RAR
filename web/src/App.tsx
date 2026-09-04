@@ -38,7 +38,18 @@ import {
   useParams,
 } from "react-router-dom";
 
-type Project = { name: string; path: string; model_ready: boolean };
+type Project = {
+  name: string;
+  path: string;
+  model_ready: boolean;
+  vision_model_ready?: boolean;
+  ocr?: {
+    available: boolean;
+    cuda: boolean;
+    model_dir: string;
+    reason?: string | null;
+  };
+};
 type RunStatus =
   | "queued"
   | "running"
@@ -106,6 +117,14 @@ const stageNames: Record<string, string> = {
   plot_reconstruction: "重建剧情",
   dialogue_extraction: "提取对话",
   dataset: "生成数据集",
+  image_scan: "扫描漫画页面",
+  visual_extraction: "提取漫画内容",
+  ocr_alignment: "校正对白文字",
+  character_catalog: "建立角色名称参考",
+  character_assignment: "映射局部角色",
+  chapter_reconstruction: "按话重建剧情",
+  dialogue_revision: "修订说话者与对白",
+  export: "导出训练数据",
 };
 const stageDescriptions: Record<string, string> = {
   chunk: "按分卷和章节规则切分原文",
@@ -114,6 +133,14 @@ const stageDescriptions: Record<string, string> = {
   plot_reconstruction: "按照剧情边界重建连续文本",
   dialogue_extraction: "从重建后的剧情中提取对话",
   dataset: "整理最终结果并导出 ShareGPT",
+  image_scan: "验证、排序图片并建立五页批次",
+  visual_extraction: "使用视觉模型并行提取对白、角色特征与剧情",
+  ocr_alignment: "使用可选 OCR 结果修正 VLM 对白",
+  character_catalog: "根据全部角色观察生成正式名称参考表",
+  character_assignment: "将各批次局部角色映射到正式名称",
+  chapter_reconstruction: "根据页面中的话标题重建剧情与对白",
+  dialogue_revision: "以文字模型再次确认每话说话者与对白",
+  export: "生成 ShareGPT 训练样本",
 };
 
 const headingSplitterSeparator = /[,，/、\\;；\s]+/;
@@ -844,6 +871,7 @@ function Workspace() {
       {showExtraction && (
         <ExtractionDialog
           chatSession={selectedId}
+          project={project}
           onClose={() => setShowExtraction(false)}
           onStarted={(value) => {
             setExtraction(value);
@@ -1080,19 +1108,25 @@ function ApprovalCard({
 
 function ExtractionDialog({
   chatSession,
+  project,
   onClose,
   onStarted,
 }: {
   chatSession?: number;
+  project?: Project;
   onClose: () => void;
   onStarted: (state: ExtractionState) => void;
 }) {
+  const [workflowType, setWorkflowType] = useState<"text" | "manga">("text");
   const [name, setName] = useState("");
   const [path, setPath] = useState("");
   const [volumeSplitters, setVolumeSplitters] = useState("");
   const [chapterSplitters, setChapterSplitters] = useState("");
   const [mode, setMode] = useState<"automatic" | "staged">("automatic");
   const [debug, setDebug] = useState(false);
+  const [imageBatchSize, setImageBatchSize] = useState(5);
+  const [ocrEnabled, setOcrEnabled] = useState(false);
+  const [preview, setPreview] = useState<string>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
 
@@ -1107,17 +1141,29 @@ function ExtractionDialog({
         method: "POST",
         body: JSON.stringify({
           chat_session: chatSession,
+          workflow_type: workflowType,
           mode,
           debug,
-          ...(volumes.length > 0 ? { volume_splitters: volumes } : {}),
-          ...(chapters.length > 0 ? { chapter_splitters: chapters } : {}),
+          ...(workflowType === "text" && volumes.length > 0
+            ? { volume_splitters: volumes }
+            : {}),
+          ...(workflowType === "text" && chapters.length > 0
+            ? { chapter_splitters: chapters }
+            : {}),
+          ...(workflowType === "manga"
+            ? {
+                vision_model: "qwen3.7-flash",
+                image_batch_size: imageBatchSize,
+                ocr_enabled: ocrEnabled,
+              }
+            : {}),
           manifest: {
             name,
             meta: {},
             resources: [
               {
                 path,
-                resource_type: "text",
+                resource_type: workflowType,
                 display_name: name,
                 narrative_order: 0,
                 meta: {},
@@ -1130,6 +1176,36 @@ function ExtractionDialog({
     } catch (requestError) {
       setError(
         requestError instanceof Error ? requestError.message : "无法开始提取",
+      );
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function previewImages() {
+    setBusy(true);
+    setError(undefined);
+    setPreview(undefined);
+    try {
+      const query = new URLSearchParams({
+        path,
+        batch_size: String(imageBatchSize),
+        debug: String(debug),
+      });
+      const value = await api<{
+        image_count: number;
+        batch_count: number;
+        first_paths: string[];
+      }>("/api/resources/manga/preview?" + query);
+      setPreview(
+        `识别到 ${value.image_count} 张图片、${value.batch_count} 个批次。` +
+          (value.first_paths.length
+            ? ` 排序开头：${value.first_paths.join("、")}`
+            : ""),
+      );
+    } catch (requestError) {
+      setError(
+        requestError instanceof Error ? requestError.message : "无法预览图片",
       );
     } finally {
       setBusy(false);
@@ -1150,16 +1226,36 @@ function ExtractionDialog({
           </div>
           <div>
             <p>NEW DATASET</p>
-            <h2>从文本提取对话</h2>
+            <h2>{workflowType === "manga" ? "从漫画提取对话" : "从文本提取对话"}</h2>
           </div>
           <button type="button" className="icon-button" onClick={onClose}>
             <X size={18} />
           </button>
         </div>
         <p className="dialog-copy">
-          RAR 会依次整理原文、识别剧情、整理角色并生成档案、重建剧情、
-          提取对白，并生成 ShareGPT 数据。
+          {workflowType === "manga"
+            ? "RAR 会扫描本地图像，以 VLM 提取对白与剧情，统一角色名称，按话重建并修订对话。"
+            : "RAR 会依次整理原文、识别剧情、整理角色并生成档案、重建剧情、提取对白，并生成 ShareGPT 数据。"}
         </p>
+        <fieldset className="mode-field">
+          <legend>资源类型</legend>
+          <button
+            type="button"
+            className={workflowType === "text" ? "selected" : ""}
+            onClick={() => setWorkflowType("text")}
+          >
+            <strong>文字</strong>
+            <small>TXT 等本地文本文件</small>
+          </button>
+          <button
+            type="button"
+            className={workflowType === "manga" ? "selected" : ""}
+            onClick={() => setWorkflowType("manga")}
+          >
+            <strong>漫画</strong>
+            <small>按页码排序的本地图像目录</small>
+          </button>
+        </fieldset>
         <label>
           数据集名称
           <input
@@ -1170,16 +1266,26 @@ function ExtractionDialog({
           />
         </label>
         <label>
-          文本文件路径
+          {workflowType === "manga" ? "漫画图像文件夹" : "文本文件路径"}
           <input
             required
             value={path}
             onChange={(event) => setPath(event.target.value)}
-            placeholder="resources/book.txt"
+            placeholder={
+              workflowType === "manga" ? "resources/manga" : "resources/book.txt"
+            }
           />
           <small>填写当前项目内的相对路径</small>
         </label>
-        <label>
+        {workflowType === "manga" && (
+          <div className="preview-row">
+            <button type="button" onClick={previewImages} disabled={busy || !path}>
+              预览图片排序
+            </button>
+            {preview && <small>{preview}</small>}
+          </div>
+        )}
+        {workflowType === "text" && <label>
           卷名匹配规则 <span>可选</span>
           <input
             value={volumeSplitters}
@@ -1187,8 +1293,8 @@ function ExtractionDialog({
             placeholder="第一卷，第一部，第一篇"
           />
           <small>可用逗号、斜杠、分号或空格分隔；数字会自动泛化</small>
-        </label>
-        <label>
+        </label>}
+        {workflowType === "text" && <label>
           章节名匹配规则 <span>可选</span>
           <input
             value={chapterSplitters}
@@ -1196,7 +1302,46 @@ function ExtractionDialog({
             placeholder="第一章，第一话，序章"
           />
           <small>例如“第一章”会转换为“第&#123;num&#125;章”</small>
-        </label>
+        </label>}
+        {workflowType === "manga" && (
+          <>
+            <label>
+              视觉模型
+              <select disabled={!project?.vision_model_ready} value="qwen3.7-flash">
+                <option value="qwen3.7-flash">Qwen3.7 Flash</option>
+              </select>
+              {!project?.vision_model_ready && (
+                <small>未检测到 QWEN_API_KEY 或 DASHSCOPE_API_KEY</small>
+              )}
+            </label>
+            <label>
+              每批图片数
+              <input
+                type="number"
+                min={1}
+                max={10}
+                value={imageBatchSize}
+                onChange={(event) => setImageBatchSize(Number(event.target.value))}
+              />
+            </label>
+            <label className="debug-option">
+              <input
+                type="checkbox"
+                checked={ocrEnabled}
+                disabled={!project?.ocr?.available}
+                onChange={(event) => setOcrEnabled(event.target.checked)}
+              />
+              <span>
+                <strong>使用 PaddleOCR-VL 修正对白</strong>
+                <small>
+                  {project?.ocr?.available
+                    ? "OCR 与视觉模型并行运行"
+                    : project?.ocr?.reason ?? "OCR 未配置"}
+                </small>
+              </span>
+            </label>
+          </>
+        )}
         <fieldset className="mode-field">
           <legend>运行方式</legend>
           <button
@@ -1224,7 +1369,11 @@ function ExtractionDialog({
           />
           <span>
             <strong>调试模式</strong>
-            <small>剧情提取和对话提取分别最多处理 5 个 Chunk</small>
+            <small>
+              {workflowType === "manga"
+                ? "仅处理排序后的前 5 个图片批次"
+                : "剧情提取和对话提取分别最多处理 5 个 Chunk"}
+            </small>
           </span>
         </label>
         {error && <p className="dialog-error">{error}</p>}
@@ -1232,7 +1381,10 @@ function ExtractionDialog({
           <button type="button" className="secondary" onClick={onClose}>
             取消
           </button>
-          <button className="primary" disabled={busy}>
+          <button
+            className="primary"
+            disabled={busy || (workflowType === "manga" && !project?.vision_model_ready)}
+          >
             {busy ? (
               <LoaderCircle className="spin" size={16} />
             ) : (

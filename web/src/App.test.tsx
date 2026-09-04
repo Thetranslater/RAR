@@ -469,4 +469,66 @@ describe("App chat navigation", () => {
       ],
     });
   });
+
+  it("previews and submits a manga workflow with manga-only options", async () => {
+    let extractionBody: Record<string, unknown> | undefined;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = String(input);
+        if (path === "/api/project") {
+          return jsonResponse({
+            ...project,
+            vision_model_ready: true,
+            ocr: { available: true, cuda: true, model_dir: "models/ocr" },
+          });
+        }
+        if (path === "/api/chats" || path === "/api/chats?archived=true") {
+          return jsonResponse([]);
+        }
+        if (path.startsWith("/api/resources/manga/preview?")) {
+          return jsonResponse({
+            image_count: 12,
+            batch_count: 3,
+            first_paths: ["resources/manga/1.jpg", "resources/manga/2.jpg"],
+          });
+        }
+        if (path === "/api/extractions" && init?.method === "POST") {
+          extractionBody = JSON.parse(String(init.body));
+          return jsonResponse(
+            { task: "manga-1", status: "queued", chat_session: 12 },
+            202,
+          );
+        }
+        throw new Error("Unexpected request: " + path);
+      }),
+    );
+
+    const user = userEvent.setup();
+    render(
+      <MemoryRouter initialEntries={["/chats/new"]}>
+        <App />
+      </MemoryRouter>,
+    );
+    await user.click(await screen.findByRole("button", { name: "提取数据集" }));
+    await user.click(screen.getByRole("button", { name: /漫画/ }));
+    await user.type(screen.getByPlaceholderText("例如：我的青春恋爱物语"), "漫画测试");
+    await user.type(screen.getByPlaceholderText("resources/manga"), "pages");
+    await user.click(screen.getByRole("button", { name: "预览图片排序" }));
+    await screen.findByText(/识别到 12 张图片、3 个批次/);
+    await user.click(screen.getByLabelText(/使用 PaddleOCR-VL/));
+    await user.click(screen.getByRole("button", { name: "开始提取" }));
+
+    await waitFor(() => expect(extractionBody).toBeDefined());
+    expect(extractionBody).toMatchObject({
+      workflow_type: "manga",
+      vision_model: "qwen3.7-flash",
+      image_batch_size: 5,
+      ocr_enabled: true,
+      manifest: {
+        name: "漫画测试",
+        resources: [{ path: "pages", resource_type: "manga" }],
+      },
+    });
+  });
 });

@@ -2,16 +2,21 @@
 
 from __future__ import annotations
 
+import base64
 import json
+import mimetypes
+from pathlib import Path
 from typing import Any
 
 import httpx
 
 from rar_agent.models.base import (
+    LocalImageContent,
     ModelMessage,
     ModelRequest,
     ModelResponse,
     ModelUsage,
+    TextContent,
     ToolCall,
 )
 
@@ -23,12 +28,14 @@ class OpenAICompatibleClient:
         provider: str,
         base_url: str,
         api_key: str,
+        project_root: Path | None = None,
         http_client: httpx.AsyncClient | None = None,
         timeout: float = 120.0,
     ) -> None:
         self._provider = provider
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
+        self._project_root = project_root.resolve() if project_root is not None else None
         self._http_client = http_client
         self._timeout = timeout
 
@@ -84,13 +91,25 @@ class OpenAICompatibleClient:
             usage=ModelUsage(
                 prompt_tokens=usage.get("prompt_tokens", 0),
                 completion_tokens=usage.get("completion_tokens", 0),
+                reasoning_tokens=(
+                    usage.get("completion_tokens_details", {}).get(
+                        "reasoning_tokens", 0
+                    )
+                    or usage.get("output_tokens_details", {}).get(
+                        "reasoning_tokens", 0
+                    )
+                ),
             ),
             finish_reason=choice.get("finish_reason"),
         )
 
-    @staticmethod
-    def _message_payload(message: ModelMessage) -> dict[str, Any]:
-        value = message.model_dump(exclude_none=True, exclude={"tool_calls"})
+    def _message_payload(self, message: ModelMessage) -> dict[str, Any]:
+        value = message.model_dump(
+            exclude_none=True,
+            exclude={"content", "tool_calls"},
+        )
+        if message.content is not None:
+            value["content"] = self._content_payload(message.content)
         if message.tool_calls:
             value["tool_calls"] = [
                 {
@@ -106,6 +125,42 @@ class OpenAICompatibleClient:
                 for call in message.tool_calls
             ]
         return value
+
+    def _content_payload(self, content: object) -> object:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return content
+        values: list[dict[str, Any]] = []
+        for block in content:
+            if isinstance(block, TextContent):
+                values.append({"type": "text", "text": block.text})
+            elif isinstance(block, LocalImageContent):
+                values.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": self._image_data_url(block.path)},
+                    }
+                )
+            else:  # pragma: no cover - Pydantic prevents unknown block types.
+                raise TypeError(f"unsupported content block: {type(block)!r}")
+        return values
+
+    def _image_data_url(self, relative_path: str) -> str:
+        if self._project_root is None:
+            raise ValueError("project_root is required for local image content")
+        image_path = (self._project_root / relative_path).resolve()
+        try:
+            image_path.relative_to(self._project_root)
+        except ValueError as error:
+            raise ValueError("local image path escapes project") from error
+        if not image_path.is_file():
+            raise FileNotFoundError(image_path)
+        mime_type, _ = mimetypes.guess_type(image_path.name)
+        if mime_type not in {"image/jpeg", "image/png", "image/webp"}:
+            raise ValueError(f"unsupported local image type: {image_path.suffix}")
+        encoded = base64.b64encode(image_path.read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
 
     @staticmethod
     def _tool_call(value: dict[str, Any]) -> ToolCall:

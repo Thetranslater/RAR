@@ -36,6 +36,7 @@ class StructuredModelGateway:
         scheduler: ModelScheduler | None = None,
         workload_id: str | None = None,
         workload_limit: int | None = None,
+        stop_on_length: bool = False,
     ) -> SchemaT:
         last_error: Exception | None = None
         for _ in range(self.max_attempts):
@@ -51,11 +52,17 @@ class StructuredModelGateway:
                     if scheduler is not None
                     else await client.complete(request)
                 )
+                if stop_on_length and response.finish_reason == "length":
+                    raise _NonRetryableStructuredOutputError(
+                        "model output was truncated (finish_reason=length)"
+                    )
                 if response.content is None:
                     raise ValueError("model returned no textual content")
                 value = self._parse_json(response.content)
                 parsed = schema.model_validate(value)
                 return validator(parsed) if validator is not None else parsed
+            except _NonRetryableStructuredOutputError as error:
+                raise StructuredOutputError(str(error)) from error
             except Exception as error:
                 last_error = error
         raise StructuredOutputError(
@@ -84,3 +91,7 @@ class StructuredModelGateway:
                 candidate = candidate[start : end + 1]
         candidate = _TRAILING_COMMA.sub(r"\1", candidate)
         return json.loads(candidate)
+
+
+class _NonRetryableStructuredOutputError(RuntimeError):
+    pass

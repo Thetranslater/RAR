@@ -1,0 +1,9 @@
+你负责分析一批按 Page 编号排列的漫画图片。只输出一个 JSON 对象，不要输出 Markdown 或解释。
+
+输出字段必须为：
+- utterances: 实际说出口的对白数组；每项包含批次局部 page_index、speaker 和 content。speaker 使用当前批次 characters 的 index，无法确定时为 null。旁白和内心独白不得作为对白。
+- characters: 当前批次人物数组；每项包含局部 index、names 数组和 description。仅在画面有明确证据时填写姓名，否则 names 为空数组。description 描述可用于跨图片辨认人物的外观和身份特征。
+- chapter_starts: 只有明确出现“第X话”或章节标题页时输出；每项包含局部 page_index 和可空 title。普通场景变化不是章节起点。
+- plot: 当前批次剧情总结，包含旁白、内心活动和重要非对白信息。非剧情页面可为空字符串。
+
+忽略页码、拟声词、目录、版权页和无关背景文字。保持对白的推断阅读顺序。即使没有剧情，也必须返回完整字段和空数组。

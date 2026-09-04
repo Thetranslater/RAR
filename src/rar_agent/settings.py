@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 from rar_agent.models.openai_compatible import OpenAICompatibleClient
 
@@ -12,6 +13,8 @@ def create_model_client(
     *,
     base_url: str | None = None,
     api_key: str | None = None,
+    project_root: Path | None = None,
+    timeout_seconds: float = 120.0,
 ) -> OpenAICompatibleClient:
     normalized = provider.lower()
     if normalized == "deepseek":
@@ -36,4 +39,6 @@ def create_model_client(
         provider=normalized,
         base_url=resolved_url,
         api_key=resolved_key,
+        project_root=project_root,
+        timeout=timeout_seconds,
     )

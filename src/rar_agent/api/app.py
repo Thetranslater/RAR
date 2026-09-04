@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -38,6 +39,15 @@ from rar_agent.workflow.dataset_build import (
     IncompleteStageError,
     WorkflowConfig,
 )
+from rar_agent.workflow.manga.dataset_build import (
+    MangaDatasetBuildWorkflow,
+    MangaWorkflowConfig,
+)
+from rar_agent.workflow.manga.ocr_runtime import (
+    OcrCapability,
+    PaddleOcrWorkerManager,
+)
+from rar_agent.workflow.manga.scanning import MangaScanError, scan_manga_folder
 
 ChatRunStatus = Literal[
     "queued",
@@ -56,6 +66,10 @@ class AppRuntime:
     model_client: ModelClient | None
     model: str
     tokenizer: Tokenizer
+    vision_model_client: ModelClient | None = None
+    vision_model: str = "qwen3.7-flash"
+    ocr_capability: OcrCapability | None = None
+    ocr_manager: PaddleOcrWorkerManager | None = None
     max_model_concurrency: int = DEFAULT_MODEL_CONCURRENCY
     max_active_chat_turns: int = 4
     max_context_tokens: int = 32_768
@@ -151,6 +165,7 @@ class ChatMessagePage(ApiModel):
 
 
 class ExtractionToolRequest(ApiModel):
+    workflow_type: Literal["text", "manga"] = "text"
     manifest: InputManifest
     dataset_root: str | None = None
     debug: bool = False
@@ -161,6 +176,13 @@ class ExtractionToolRequest(ApiModel):
     include_headings: bool = False
     include_front_matter: bool = False
     mode: Literal["automatic", "staged"] = "automatic"
+    vision_model: str = "qwen3.7-flash"
+    text_model: str | None = None
+    image_batch_size: int = Field(default=5, ge=1, le=10)
+    hard_directory_boundaries: bool = False
+    ocr_enabled: bool = False
+    ocr_batch_size: int = Field(default=4, ge=1)
+    ocr_threshold: int = Field(default=70, ge=0, le=100)
 
 
 class ExtractionRequest(ExtractionToolRequest):
@@ -173,10 +195,20 @@ class ExtractionAccepted(ApiModel):
     chat_session: int
 
 
+class ModelOptionResponse(ApiModel):
+    provider: str
+    model: str
+    capabilities: list[Literal["text", "vision"]]
+    available: bool
+    environment_variables: list[str]
+    reason: str | None = None
+
+
 @dataclass(slots=True)
 class _TaskState:
     chat_session: int
     workflow_run: int
+    workflow_type: Literal["text", "manga"] = "text"
     status: str = "queued"
     stage: str | None = None
     dataset_root: str | None = None
@@ -186,6 +218,7 @@ class _TaskState:
     def value(self) -> dict[str, Any]:
         return {
             "chat_session": self.chat_session,
+            "workflow_type": self.workflow_type,
             "status": self.status,
             "stage": self.stage,
             "dataset_root": self.dataset_root,
@@ -225,7 +258,13 @@ class _PendingApprovalState:
 
 
 def create_app(runtime: AppRuntime) -> FastAPI:
-    app = FastAPI(title="RAR Agent", version="0.1.0")
+    @asynccontextmanager
+    async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        yield
+        if runtime.ocr_manager is not None:
+            await runtime.ocr_manager.close()
+
+    app = FastAPI(title="RAR Agent", version="0.1.0", lifespan=lifespan)
     task_states: dict[str, _TaskState] = {}
     active_tasks: set[asyncio.Task[None]] = set()
     chat_runs: dict[str, _ChatRunState] = {}
@@ -364,9 +403,11 @@ def create_app(runtime: AppRuntime) -> FastAPI:
     def _extraction_tool(chat_session: int) -> RegisteredTool:
         async def start_text_extraction(arguments: dict[str, Any]) -> dict[str, Any]:
             value = ExtractionToolRequest.model_validate(arguments)
+            payload = value.model_dump(mode="python")
+            payload["workflow_type"] = "text"
             accepted = submit_extraction(
                 ExtractionRequest(
-                    **value.model_dump(mode="python"),
+                    **payload,
                     chat_session=chat_session,
                 )
             )
@@ -390,6 +431,37 @@ def create_app(runtime: AppRuntime) -> FastAPI:
             ),
         )
 
+    def _manga_extraction_tool(chat_session: int) -> RegisteredTool:
+        async def start_manga_extraction(arguments: dict[str, Any]) -> dict[str, Any]:
+            value = ExtractionToolRequest.model_validate(arguments)
+            payload = value.model_dump(mode="python")
+            payload["workflow_type"] = "manga"
+            accepted = submit_extraction(
+                ExtractionRequest(
+                    **payload,
+                    chat_session=chat_session,
+                )
+            )
+            return accepted.model_dump(mode="json")
+
+        return RegisteredTool(
+            definition=ToolDefinition(
+                name="start_manga_extraction",
+                description=(
+                    "Start or resume RAR's fixed manga Dataset workflow for one "
+                    "Project-relative image folder."
+                ),
+                parameters=ExtractionToolRequest.model_json_schema(),
+            ),
+            effect="write",
+            handler=start_manga_extraction,
+            authorization=ToolAuthorization(
+                mode="always",
+                risk="medium",
+                reason="This starts a Workflow that writes manga Dataset artifacts.",
+            ),
+        )
+
     def create_harness(chat_session: int) -> AgentHarness:
         model_client = runtime.model_client
         if model_client is None:
@@ -402,6 +474,7 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                 [
                     *build_workspace_tools(runtime.project_root),
                     _extraction_tool(chat_session),
+                    _manga_extraction_tool(chat_session),
                 ],
             ),
             database=runtime.database,
@@ -444,6 +517,17 @@ def create_app(runtime: AppRuntime) -> FastAPI:
         model_client = runtime.model_client
         if model_client is None:
             raise HTTPException(503, "No model provider is configured")
+        if request.workflow_type == "manga" and runtime.vision_model_client is None:
+            raise HTTPException(503, "No vision model provider is configured")
+        if request.ocr_enabled and (
+            runtime.ocr_capability is None or not runtime.ocr_capability.available
+        ):
+            reason = (
+                runtime.ocr_capability.reason
+                if runtime.ocr_capability is not None
+                else "OCR capability was not probed"
+            )
+            raise HTTPException(422, reason)
         if request.chat_session is None:
             chat_session = runtime.database.create_chat(f"提取: {request.manifest.name}")
         else:
@@ -456,7 +540,11 @@ def create_app(runtime: AppRuntime) -> FastAPI:
         workflow_run = runtime.database.create_workflow_run(
             dataset_hint, chat_session=chat_session
         )
-        state = _TaskState(chat_session=chat_session, workflow_run=workflow_run)
+        state = _TaskState(
+            chat_session=chat_session,
+            workflow_run=workflow_run,
+            workflow_type=request.workflow_type,
+        )
         task_states[task_name] = state
         runtime.database.append_event(
             chat_session, f"已开始提取数据集: {request.manifest.name}"
@@ -489,39 +577,66 @@ def create_app(runtime: AppRuntime) -> FastAPI:
         async def execute() -> None:
             state.status = "running"
             runtime.database.update_workflow_run(workflow_run, status="running")
-            workflow = DatasetBuildWorkflow(
-                model_client=model_client,
-                tokenizer=runtime.tokenizer,
-                config=WorkflowConfig(
-                    model=runtime.model,
-                    debug=request.debug,
-                    text_chunk_tokens=request.text_chunk_tokens,
-                    plot_chunk_tokens=request.plot_chunk_tokens,
-                    volume_splitters=(
-                        tuple(request.volume_splitters)
-                        if request.volume_splitters is not None
-                        else None
-                    ),
-                    chapter_splitters=(
-                        tuple(request.chapter_splitters)
-                        if request.chapter_splitters is not None
-                        else None
-                    ),
-                    include_headings=request.include_headings,
-                    include_front_matter=request.include_front_matter,
-                ),
-                stage_callback=stage_callback,
-                scheduler=runtime.scheduler,
-            )
             try:
+                target_root = (
+                    runtime.project_root / request.dataset_root
+                    if request.dataset_root
+                    else None
+                )
+                workflow: MangaDatasetBuildWorkflow | DatasetBuildWorkflow
+                if request.workflow_type == "manga":
+                    vision_client = runtime.vision_model_client
+                    if vision_client is None:  # guarded before scheduling
+                        raise RuntimeError("No vision model provider is configured")
+                    workflow = MangaDatasetBuildWorkflow(
+                        vision_model_client=vision_client,
+                        text_model_client=model_client,
+                        tokenizer=runtime.tokenizer,
+                        config=MangaWorkflowConfig(
+                            vision_model=request.vision_model,
+                            text_model=request.text_model or runtime.model,
+                            debug=request.debug,
+                            image_batch_size=request.image_batch_size,
+                            hard_directory_boundaries=(
+                                request.hard_directory_boundaries
+                            ),
+                            ocr_enabled=request.ocr_enabled,
+                            ocr_batch_size=request.ocr_batch_size,
+                            ocr_threshold=request.ocr_threshold,
+                        ),
+                        stage_callback=stage_callback,
+                        scheduler=runtime.scheduler,
+                        ocr_runner=runtime.ocr_manager,
+                    )
+                else:
+                    workflow = DatasetBuildWorkflow(
+                        model_client=model_client,
+                        tokenizer=runtime.tokenizer,
+                        config=WorkflowConfig(
+                            model=runtime.model,
+                            debug=request.debug,
+                            text_chunk_tokens=request.text_chunk_tokens,
+                            plot_chunk_tokens=request.plot_chunk_tokens,
+                            volume_splitters=(
+                                tuple(request.volume_splitters)
+                                if request.volume_splitters is not None
+                                else None
+                            ),
+                            chapter_splitters=(
+                                tuple(request.chapter_splitters)
+                                if request.chapter_splitters is not None
+                                else None
+                            ),
+                            include_headings=request.include_headings,
+                            include_front_matter=request.include_front_matter,
+                        ),
+                        stage_callback=stage_callback,
+                        scheduler=runtime.scheduler,
+                    )
                 result = await workflow.run(
                     runtime.project_root,
                     request.manifest,
-                    dataset_root=(
-                        runtime.project_root / request.dataset_root
-                        if request.dataset_root
-                        else None
-                    ),
+                    dataset_root=target_root,
                 )
                 state.status = "completed"
                 state.dataset_root = result.dataset_root.relative_to(
@@ -579,10 +694,82 @@ def create_app(runtime: AppRuntime) -> FastAPI:
 
     @app.get("/api/project")
     async def project() -> dict[str, Any]:
+        ocr = runtime.ocr_capability
         return {
             "name": runtime.project_root.name,
             "path": str(runtime.project_root),
             "model_ready": runtime.model_client is not None,
+            "vision_model_ready": runtime.vision_model_client is not None,
+            "ocr": (
+                ocr.model_dump(mode="json")
+                if ocr is not None
+                else {
+                    "available": False,
+                    "cuda": False,
+                    "model_dir": "",
+                    "reason": "OCR capability was not probed",
+                }
+            ),
+        }
+
+    @app.get("/api/models", response_model=list[ModelOptionResponse])
+    async def models() -> list[ModelOptionResponse]:
+        text_provider = (
+            runtime.model_client.provider if runtime.model_client is not None else "deepseek"
+        )
+        return [
+            ModelOptionResponse(
+                provider=text_provider,
+                model=runtime.model,
+                capabilities=["text"],
+                available=runtime.model_client is not None,
+                environment_variables=(
+                    ["QWEN_API_KEY", "DASHSCOPE_API_KEY"]
+                    if text_provider == "qwen"
+                    else ["DEEPSEEK_API_KEY"]
+                ),
+                reason=(
+                    None
+                    if runtime.model_client is not None
+                    else "The text provider API key is unavailable"
+                ),
+            ),
+            ModelOptionResponse(
+                provider="qwen",
+                model=runtime.vision_model,
+                capabilities=["text", "vision"],
+                available=runtime.vision_model_client is not None,
+                environment_variables=["QWEN_API_KEY", "DASHSCOPE_API_KEY"],
+                reason=(
+                    None
+                    if runtime.vision_model_client is not None
+                    else "Set QWEN_API_KEY or DASHSCOPE_API_KEY"
+                ),
+            ),
+        ]
+
+    @app.get("/api/resources/manga/preview")
+    async def preview_manga_resource(
+        path: str = Query(min_length=1),
+        batch_size: int = Query(default=5, ge=1, le=10),
+        debug: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            scan = scan_manga_folder(
+                runtime.project_root,
+                path,
+                batch_size=batch_size,
+                max_batches=5 if debug else None,
+            )
+        except MangaScanError as error:
+            raise HTTPException(422, str(error)) from error
+        return {
+            "path": scan.resource_path,
+            "image_count": len(scan.pages),
+            "batch_count": len(scan.batches),
+            "first_paths": [page.path for page in scan.pages[:10]],
+            "skipped": [],
+            "errors": [],
         }
 
     @app.get("/api/chats", response_model=list[ChatSummaryResponse])

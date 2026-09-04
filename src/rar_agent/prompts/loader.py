@@ -10,6 +10,11 @@ PROMPT_STAGES = (
     "plot_extraction",
     "character_profile",
     "dialogue_extraction",
+    "manga_visual_extraction",
+    "manga_character_catalog",
+    "manga_character_assignment",
+    "manga_dialogue_revision",
+    "manga_character_profile",
 )
 PROMPT_SEPARATOR_RE = re.compile(r"^----------$", re.MULTILINE)
 
