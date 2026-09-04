@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from pathlib import PurePath, PureWindowsPath
 from typing import Annotated, Any, Literal
 
 from pydantic import (
@@ -14,18 +13,9 @@ from pydantic import (
     model_validator,
 )
 
+from rar_agent.paths import workspace_relative_path
+
 JsonObject = dict[str, Any]
-
-
-def _workspace_relative_path(value: str) -> str:
-    normalized = value.replace("\\", "/").strip()
-    if not normalized:
-        raise ValueError("path must not be empty")
-    if PurePath(normalized).is_absolute() or PureWindowsPath(normalized).is_absolute():
-        raise ValueError("path must be workspace-relative")
-    if ".." in PurePath(normalized).parts:
-        raise ValueError("path must not escape the workspace")
-    return normalized
 
 
 class DomainModel(BaseModel):
@@ -39,7 +29,7 @@ class InputResource(DomainModel):
     narrative_order: Annotated[int, Field(ge=0)]
     meta: JsonObject = Field(default_factory=dict)
 
-    _validate_path = field_validator("path")(_workspace_relative_path)
+    _validate_path = field_validator("path")(workspace_relative_path)
 
 
 class InputManifest(DomainModel):
@@ -62,21 +52,21 @@ class TextChunk(DomainModel):
     token_count: Annotated[int, Field(ge=0)]
     meta: JsonObject = Field(default_factory=dict)
 
-    _validate_file = field_validator("file")(_workspace_relative_path)
+    _validate_file = field_validator("file")(workspace_relative_path)
 
 
 class PlotRef(DomainModel):
     path: str
     index: Annotated[int, Field(ge=0)]
 
-    _validate_path = field_validator("path")(_workspace_relative_path)
+    _validate_path = field_validator("path")(workspace_relative_path)
 
 
 class CharacterRef(DomainModel):
     path: str
     index: Annotated[int, Field(ge=0)]
 
-    _validate_path = field_validator("path")(_workspace_relative_path)
+    _validate_path = field_validator("path")(workspace_relative_path)
 
 
 class CharacterCandidate(DomainModel):
@@ -138,7 +128,7 @@ class PlotChunkRef(DomainModel):
     plot_index: Annotated[int, Field(ge=0)]
     chunk_index: Annotated[int, Field(ge=0)]
 
-    _validate_path = field_validator("path")(_workspace_relative_path)
+    _validate_path = field_validator("path")(workspace_relative_path)
 
 
 class TextChunkSpanRef(DomainModel):
@@ -147,7 +137,7 @@ class TextChunkSpanRef(DomainModel):
     start: Annotated[int, Field(ge=0)]
     end: Annotated[int, Field(gt=0)]
 
-    _validate_path = field_validator("path")(_workspace_relative_path)
+    _validate_path = field_validator("path")(workspace_relative_path)
 
     @model_validator(mode="after")
     def validate_span(self) -> TextChunkSpanRef:
@@ -225,7 +215,7 @@ class DatasetResource(DomainModel):
     media_type: Annotated[str, Field(min_length=1)]
     meta: JsonObject = Field(default_factory=dict)
 
-    _validate_path = field_validator("path")(_workspace_relative_path)
+    _validate_path = field_validator("path")(workspace_relative_path)
 
 
 class DatasetBundle(DomainModel):

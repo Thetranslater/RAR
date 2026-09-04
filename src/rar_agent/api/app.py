@@ -5,17 +5,17 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from rar_agent.agent.harness import AgentHarness, AgentRunResult, PendingAgentRun
 from rar_agent.agent.tools import (
@@ -47,7 +47,11 @@ from rar_agent.workflow.manga.ocr_runtime import (
     OcrCapability,
     PaddleOcrWorkerManager,
 )
-from rar_agent.workflow.manga.scanning import MangaScanError, preview_manga_folder
+from rar_agent.workflow.manga.scanning import (
+    MangaScanError,
+    preview_manga_folder,
+    scan_manga_folder,
+)
 
 ChatRunStatus = Literal[
     "queued",
@@ -164,18 +168,33 @@ class ChatMessagePage(ApiModel):
     next_before: int | None = None
 
 
-class ExtractionToolRequest(ApiModel):
-    workflow_type: Literal["text", "manga"] = "text"
+class CommonExtractionToolRequest(ApiModel):
     manifest: InputManifest
     dataset_root: str | None = None
     debug: bool = False
+    mode: Literal["automatic", "staged"] = "automatic"
+
+
+class TextExtractionToolRequest(CommonExtractionToolRequest):
+    workflow_type: Literal["text"] = "text"
     text_chunk_tokens: int = Field(default=5120, ge=1)
     plot_chunk_tokens: int = Field(default=5120, ge=1)
     volume_splitters: list[str] | None = None
     chapter_splitters: list[str] | None = None
     include_headings: bool = False
     include_front_matter: bool = False
-    mode: Literal["automatic", "staged"] = "automatic"
+
+    @model_validator(mode="after")
+    def validate_text_resources(self) -> TextExtractionToolRequest:
+        if not self.manifest.resources:
+            raise ValueError("an extraction requires at least one resource")
+        if any(resource.resource_type != "text" for resource in self.manifest.resources):
+            raise ValueError("text extraction only accepts text resources")
+        return self
+
+
+class MangaExtractionToolRequest(CommonExtractionToolRequest):
+    workflow_type: Literal["manga"] = "manga"
     vision_model: str = "qwen3.7-flash"
     text_model: str | None = None
     image_batch_size: int = Field(default=5, ge=1, le=10)
@@ -184,9 +203,35 @@ class ExtractionToolRequest(ApiModel):
     ocr_batch_size: int = Field(default=4, ge=1)
     ocr_threshold: int = Field(default=70, ge=0, le=100)
 
+    @model_validator(mode="after")
+    def validate_manga_resource(self) -> MangaExtractionToolRequest:
+        if not self.manifest.resources:
+            raise ValueError("an extraction requires at least one resource")
+        if len(self.manifest.resources) != 1:
+            raise ValueError("manga extraction requires exactly one image folder")
+        if self.manifest.resources[0].resource_type != "manga":
+            raise ValueError("manga extraction requires a manga resource")
+        return self
 
-class ExtractionRequest(ExtractionToolRequest):
+
+ExtractionToolRequest = Annotated[
+    TextExtractionToolRequest | MangaExtractionToolRequest,
+    Field(discriminator="workflow_type"),
+]
+
+
+class TextExtractionRequest(TextExtractionToolRequest):
     chat_session: int | None = None
+
+
+class MangaExtractionRequest(MangaExtractionToolRequest):
+    chat_session: int | None = None
+
+
+ExtractionRequest = Annotated[
+    TextExtractionRequest | MangaExtractionRequest,
+    Field(discriminator="workflow_type"),
+]
 
 
 class ExtractionAccepted(ApiModel):
@@ -199,6 +244,8 @@ class ModelOptionResponse(ApiModel):
     provider: str
     model: str
     capabilities: list[Literal["text", "vision"]]
+    context_tokens: int
+    max_images: int
     available: bool
     environment_variables: list[str]
     reason: str | None = None
@@ -214,6 +261,7 @@ class _TaskState:
     dataset_root: str | None = None
     error: str | None = None
     confirmation: asyncio.Event | None = None
+    progress: dict[str, dict[str, int]] = field(default_factory=dict)
 
     def value(self) -> dict[str, Any]:
         return {
@@ -223,6 +271,7 @@ class _TaskState:
             "stage": self.stage,
             "dataset_root": self.dataset_root,
             "error": self.error,
+            "progress": self.progress,
         }
 
 
@@ -266,7 +315,7 @@ def create_app(runtime: AppRuntime) -> FastAPI:
 
     app = FastAPI(title="RAR Agent", version="0.1.0", lifespan=lifespan)
     task_states: dict[str, _TaskState] = {}
-    active_tasks: set[asyncio.Task[None]] = set()
+    active_tasks: dict[str, asyncio.Task[None]] = {}
     chat_runs: dict[str, _ChatRunState] = {}
     active_run_by_chat: dict[int, str] = {}
     chat_tasks: dict[str, asyncio.Task[None]] = {}
@@ -402,12 +451,11 @@ def create_app(runtime: AppRuntime) -> FastAPI:
 
     def _extraction_tool(chat_session: int) -> RegisteredTool:
         async def start_text_extraction(arguments: dict[str, Any]) -> dict[str, Any]:
-            value = ExtractionToolRequest.model_validate(arguments)
-            payload = value.model_dump(mode="python")
-            payload["workflow_type"] = "text"
+            payload = {**arguments, "workflow_type": "text"}
+            value = TextExtractionToolRequest.model_validate(payload)
             accepted = submit_extraction(
-                ExtractionRequest(
-                    **payload,
+                TextExtractionRequest(
+                    **value.model_dump(mode="python"),
                     chat_session=chat_session,
                 )
             )
@@ -420,7 +468,7 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                     "Start or resume RAR's fixed text Dataset workflow after resolving a "
                     "local InputManifest. Use Project-relative resource paths."
                 ),
-                parameters=ExtractionToolRequest.model_json_schema(),
+                parameters=TextExtractionToolRequest.model_json_schema(),
             ),
             effect="write",
             handler=start_text_extraction,
@@ -433,12 +481,11 @@ def create_app(runtime: AppRuntime) -> FastAPI:
 
     def _manga_extraction_tool(chat_session: int) -> RegisteredTool:
         async def start_manga_extraction(arguments: dict[str, Any]) -> dict[str, Any]:
-            value = ExtractionToolRequest.model_validate(arguments)
-            payload = value.model_dump(mode="python")
-            payload["workflow_type"] = "manga"
+            payload = {**arguments, "workflow_type": "manga"}
+            value = MangaExtractionToolRequest.model_validate(payload)
             accepted = submit_extraction(
-                ExtractionRequest(
-                    **payload,
+                MangaExtractionRequest(
+                    **value.model_dump(mode="python"),
                     chat_session=chat_session,
                 )
             )
@@ -451,7 +498,7 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                     "Start or resume RAR's fixed manga Dataset workflow for one "
                     "Project-relative image folder."
                 ),
-                parameters=ExtractionToolRequest.model_json_schema(),
+                parameters=MangaExtractionToolRequest.model_json_schema(),
             ),
             effect="write",
             handler=start_manga_extraction,
@@ -517,17 +564,22 @@ def create_app(runtime: AppRuntime) -> FastAPI:
         model_client = runtime.model_client
         if model_client is None:
             raise HTTPException(503, "No model provider is configured")
-        if request.workflow_type == "manga" and runtime.vision_model_client is None:
-            raise HTTPException(503, "No vision model provider is configured")
-        if request.ocr_enabled and (
-            runtime.ocr_capability is None or not runtime.ocr_capability.available
-        ):
-            reason = (
-                runtime.ocr_capability.reason
-                if runtime.ocr_capability is not None
-                else "OCR capability was not probed"
-            )
-            raise HTTPException(422, reason)
+        if request.workflow_type == "manga":
+            if runtime.vision_model_client is None:
+                raise HTTPException(503, "No vision model provider is configured")
+            if request.vision_model != runtime.vision_model:
+                raise HTTPException(422, "The selected vision model is not registered")
+            if request.text_model is not None and request.text_model != runtime.model:
+                raise HTTPException(422, "The selected text model is not registered")
+            if request.ocr_enabled and (
+                runtime.ocr_capability is None or not runtime.ocr_capability.available
+            ):
+                reason = (
+                    runtime.ocr_capability.reason
+                    if runtime.ocr_capability is not None
+                    else "OCR capability was not probed"
+                )
+                raise HTTPException(422, reason)
         if request.chat_session is None:
             chat_session = runtime.database.create_chat(f"提取: {request.manifest.name}")
         else:
@@ -574,6 +626,9 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                     workflow_run, status="running", stage=stage
                 )
 
+        async def progress_callback(stage: str, current: int, total: int) -> None:
+            state.progress[stage] = {"current": current, "total": total}
+
         async def execute() -> None:
             state.status = "running"
             runtime.database.update_workflow_run(workflow_run, status="running")
@@ -609,6 +664,7 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                         stage_callback=stage_callback,
                         scheduler=runtime.scheduler,
                         ocr_runner=runtime.ocr_manager,
+                        progress_callback=progress_callback,
                     )
                 else:
                     workflow = DatasetBuildWorkflow(
@@ -670,6 +726,15 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                 runtime.database.append_event(
                     chat_session, f"数据集提取不完整: {error}"
                 )
+            except asyncio.CancelledError:
+                state.status = "cancelled"
+                runtime.database.update_workflow_run(
+                    workflow_run,
+                    status="cancelled",
+                    stage=state.stage,
+                )
+                runtime.database.append_event(chat_session, "数据集提取已停止。")
+                raise
             except Exception as error:
                 state.status = "failed"
                 state.error = str(error)
@@ -684,8 +749,8 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                 )
 
         task = asyncio.create_task(execute(), name=f"rar-extraction-{task_name}")
-        active_tasks.add(task)
-        task.add_done_callback(active_tasks.discard)
+        active_tasks[task_name] = task
+        task.add_done_callback(lambda _task: active_tasks.pop(task_name, None))
         return ExtractionAccepted(
             task=task_name, status=state.status, chat_session=chat_session
         )
@@ -724,6 +789,8 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                 provider=text_provider,
                 model=runtime.model,
                 capabilities=["text"],
+                context_tokens=runtime.max_context_tokens,
+                max_images=0,
                 available=runtime.model_client is not None,
                 environment_variables=(
                     ["QWEN_API_KEY", "DASHSCOPE_API_KEY"]
@@ -740,6 +807,8 @@ def create_app(runtime: AppRuntime) -> FastAPI:
                 provider="qwen",
                 model=runtime.vision_model,
                 capabilities=["text", "vision"],
+                context_tokens=131_072,
+                max_images=10,
                 available=runtime.vision_model_client is not None,
                 environment_variables=["QWEN_API_KEY", "DASHSCOPE_API_KEY"],
                 reason=(
@@ -754,6 +823,7 @@ def create_app(runtime: AppRuntime) -> FastAPI:
     async def preview_manga_resource(
         path: str = Query(min_length=1),
         batch_size: int = Query(default=5, ge=1, le=10),
+        debug: bool = False,
     ) -> dict[str, Any]:
         try:
             preview = preview_manga_folder(
@@ -763,7 +833,17 @@ def create_app(runtime: AppRuntime) -> FastAPI:
             )
         except MangaScanError as error:
             raise HTTPException(422, str(error)) from error
-        return preview.model_dump(mode="json")
+        value = preview.model_dump(mode="json")
+        if debug and preview.image_count > 0 and not preview.errors:
+            debug_scan = scan_manga_folder(
+                runtime.project_root,
+                path,
+                batch_size=batch_size,
+                max_batches=5,
+            )
+            value["debug_image_count"] = len(debug_scan.pages)
+            value["debug_batch_count"] = len(debug_scan.batches)
+        return value
 
     @app.get("/api/chats", response_model=list[ChatSummaryResponse])
     async def chats(archived: bool = False) -> list[ChatSummaryResponse]:
@@ -995,6 +1075,20 @@ def create_app(runtime: AppRuntime) -> FastAPI:
         )
         state.confirmation.set()
         return {"status": "confirmed"}
+
+    @app.post("/api/extractions/{task_name}/cancel")
+    async def cancel_extraction(task_name: str) -> dict[str, Any]:
+        state = task_states.get(task_name)
+        if state is None:
+            raise HTTPException(404, "Extraction task not found")
+        if state.status in {"completed", "failed", "incomplete", "cancelled"}:
+            return {"task": task_name, **state.value()}
+        task = active_tasks.get(task_name)
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
+        return {"task": task_name, **state.value()}
 
     packaged_frontend = Path(__file__).parents[1] / "web_dist"
     development_frontend = Path(__file__).parents[3] / "web" / "dist"

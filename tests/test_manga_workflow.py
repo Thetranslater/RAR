@@ -1,12 +1,14 @@
 import json
 from pathlib import Path
 
+import pytest
 from PIL import Image
 
 from rar_agent.domain.models import InputManifest, InputResource, PlotChunkRef
 from rar_agent.models.base import LocalImageContent, TextContent
 from rar_agent.models.scripted import ScriptedModelClient
 from rar_agent.text.tokenizer import CharacterTokenizer
+from rar_agent.workflow.dataset_build import IncompleteStageError
 from rar_agent.workflow.manga.dataset_build import (
     MangaDatasetBuildWorkflow,
     MangaWorkflowConfig,
@@ -98,9 +100,13 @@ async def test_manga_workflow_builds_dataset_and_sharegpt_from_local_images(
         provider="scripted-text",
     )
     events: list[tuple[str, str]] = []
+    progress: list[tuple[str, int, int]] = []
 
     async def record_stage(stage: str, phase: str, _artifact: Path) -> None:
         events.append((stage, phase))
+
+    async def record_progress(stage: str, current: int, total: int) -> None:
+        progress.append((stage, current, total))
 
     workflow = MangaDatasetBuildWorkflow(
         vision_model_client=visual_client,
@@ -112,6 +118,7 @@ async def test_manga_workflow_builds_dataset_and_sharegpt_from_local_images(
             max_concurrency=2,
         ),
         stage_callback=record_stage,
+        progress_callback=record_progress,
     )
 
     result = await workflow.run(tmp_path, _manifest())
@@ -170,6 +177,8 @@ async def test_manga_workflow_builds_dataset_and_sharegpt_from_local_images(
         )
         for phase in ("started", "completed")
     ]
+    assert ("visual_extraction", 1, 1) in progress
+    assert ("character_profile", 1, 1) in progress
 
     resumed_visual = ScriptedModelClient([], provider="qwen")
     resumed_text = ScriptedModelClient([], provider="scripted-text")
@@ -191,3 +200,26 @@ async def test_manga_workflow_builds_dataset_and_sharegpt_from_local_images(
     assert resumed_result.bundle == result.bundle
     assert resumed_visual.requests == []
     assert resumed_text.requests == []
+
+
+async def test_manga_workflow_writes_summary_for_failed_visual_batches(
+    tmp_path: Path,
+) -> None:
+    _write_pages(tmp_path)
+    workflow = MangaDatasetBuildWorkflow(
+        vision_model_client=ScriptedModelClient(
+            ["not json", "still not json"],
+            provider="qwen",
+        ),
+        text_model_client=ScriptedModelClient([]),
+        tokenizer=CharacterTokenizer(),
+        config=MangaWorkflowConfig(visual_max_attempts=2),
+    )
+
+    with pytest.raises(IncompleteStageError) as captured:
+        await workflow.run(tmp_path, _manifest())
+
+    report_path = captured.value.dataset_root / "reports" / "manga_extraction_summary.json"
+    report = json.loads(report_path.read_text(encoding="utf-8"))
+    assert report["status"] == "incomplete"
+    assert report["counts"]["failed_visual_batches"] == 1

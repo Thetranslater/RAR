@@ -75,7 +75,6 @@ def reconstruct_manga_chapters(
             if (
                 result.plot
                 and any(start_page <= page < end_page for page in batch.page_indexes)
-                and result.plot not in plot_parts
             ):
                 plot_parts.append(result.plot)
         chapter_lines = [

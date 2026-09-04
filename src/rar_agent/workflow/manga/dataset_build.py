@@ -72,6 +72,7 @@ from rar_agent.workflow.manga.scanning import scan_manga_folder
 JsonObject = dict[str, Any]
 SchemaT = TypeVar("SchemaT", bound=BaseModel)
 StagePhase = Literal["started", "completed"]
+ProgressCallback = Callable[[str, int, int], Awaitable[None]]
 MANGA_PLOTS_PATH = "work/manga/plots.json"
 MANGA_CHARACTER_PROFILES_PATH = "work/manga/character_profiles.jsonl"
 _UNSAFE_FILE_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]+')
@@ -84,6 +85,7 @@ class OcrRunner(Protocol):
         pages: list[ImagePage],
         *,
         batch_size: int,
+        progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> list[OcrPageResult]: ...
 
 
@@ -212,6 +214,7 @@ class MangaDatasetBuildWorkflow:
         stage_callback: StageCallback | None = None,
         scheduler: ModelScheduler | None = None,
         ocr_runner: OcrRunner | None = None,
+        progress_callback: ProgressCallback | None = None,
     ) -> None:
         self.vision_model_client = vision_model_client
         self.text_model_client = text_model_client
@@ -225,6 +228,7 @@ class MangaDatasetBuildWorkflow:
         )
         self.scheduler_workload_id = str(uuid4())
         self.ocr_runner = ocr_runner
+        self.progress_callback = progress_callback
 
     async def run(
         self,
@@ -291,11 +295,16 @@ class MangaDatasetBuildWorkflow:
         try:
             visual_results = await self._visual_extractions(store, paths, scan)
             ocr_pages = await ocr_task if ocr_task is not None else []
-        except BaseException:
+        except BaseException as error:
             if ocr_task is not None and not ocr_task.done():
                 ocr_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await ocr_task
+            if (
+                isinstance(error, IncompleteStageError)
+                and error.stage == "visual_extraction"
+            ):
+                self._write_incomplete_visual_report(store, paths, scan)
             raise
         await self._stage_event(
             "visual_extraction", "completed", paths.visual_extractions
@@ -620,6 +629,11 @@ class MangaDatasetBuildWorkflow:
                 project_root,
                 pending,
                 batch_size=self.config.ocr_batch_size,
+                progress_callback=lambda current, total: self._stage_progress(
+                    "ocr",
+                    len(existing) + current,
+                    len(existing) + total,
+                ),
             )
             existing.update((result.page_index, result) for result in generated)
             ordered = [
@@ -634,6 +648,7 @@ class MangaDatasetBuildWorkflow:
         missing = [page.page_index for page in scan.pages if page.page_index not in existing]
         if missing:
             raise IncompleteStageError("ocr", store.root, missing)
+        await self._stage_progress("ocr", len(scan.pages), len(scan.pages))
         return [existing[page.page_index] for page in scan.pages]
 
     async def _character_catalog(
@@ -979,8 +994,11 @@ class MangaDatasetBuildWorkflow:
                 pending.append(index)
         store.write_jsonl(path, records)
         lock = asyncio.Lock()
+        completed = len(inputs) - len(pending)
+        await self._stage_progress(stage, completed, len(inputs))
 
         async def execute(index: int) -> None:
+            nonlocal completed
             try:
                 value = await generator(index)
                 records[index]["result"] = value.model_dump(mode="json")
@@ -990,6 +1008,8 @@ class MangaDatasetBuildWorkflow:
                 records[index]["error"] = str(error)
             async with lock:
                 store.write_jsonl(path, records)
+                completed += 1
+                await self._stage_progress(stage, completed, len(inputs))
 
         await asyncio.gather(*(execute(index) for index in pending))
         failed = [
@@ -1224,6 +1244,10 @@ class MangaDatasetBuildWorkflow:
         if self.stage_callback is not None:
             await self.stage_callback(stage, phase, artifact)
 
+    async def _stage_progress(self, stage: str, current: int, total: int) -> None:
+        if self.progress_callback is not None:
+            await self.progress_callback(stage, current, total)
+
     @staticmethod
     def _write_character_files(
         paths: MangaPaths,
@@ -1233,6 +1257,28 @@ class MangaDatasetBuildWorkflow:
             safe_name = _UNSAFE_FILE_CHARS.sub("-", profile.name).strip(" .-")
             path = paths.characters / f"{index:04d}-{safe_name or 'character'}.txt"
             path.write_text(profile.profile + "\n", encoding="utf-8", newline="\n")
+
+    @staticmethod
+    def _write_incomplete_visual_report(
+        store: DatasetArtifactStore,
+        paths: MangaPaths,
+        scan: MangaScan,
+    ) -> None:
+        records = store.read_jsonl(paths.visual_extractions)
+        failed = sum(record.get("result") == {} for record in records)
+        store.write_json(
+            paths.report,
+            {
+                "status": "incomplete",
+                "stage": "visual_extraction",
+                "counts": {
+                    "pages": len(scan.pages),
+                    "batches": len(scan.batches),
+                    "failed_visual_batches": failed,
+                },
+                "warnings": ["some visual batches failed and require resume"],
+            },
+        )
 
     @staticmethod
     def _write_report(
@@ -1273,6 +1319,9 @@ class MangaDatasetBuildWorkflow:
             warnings.append("some OCR pages failed and used VLM text")
         if export_report.sample_count == 0:
             warnings.append("ShareGPT export contains zero samples")
+        no_dialogue_chapters = sum(not value.utterances for value in revisions)
+        if no_dialogue_chapters:
+            warnings.append("some chapters contain no dialogue")
         store.write_json(
             paths.report,
             {
@@ -1286,6 +1335,7 @@ class MangaDatasetBuildWorkflow:
                     "empty_visual_batches": empty_batches,
                     "unknown_dialogue": unknown_dialogue,
                     "failed_ocr_pages": failed_ocr,
+                    "no_dialogue_chapters": no_dialogue_chapters,
                 },
                 "warnings": warnings,
             },

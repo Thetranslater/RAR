@@ -39,6 +39,19 @@ describe("App chat navigation", () => {
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
         if (path === "/api/project") return jsonResponse(project);
+        if (path === "/api/models") {
+          return jsonResponse([
+            {
+              provider: "qwen",
+              model: "qwen3.7-flash",
+              capabilities: ["text", "vision"],
+              context_tokens: 131072,
+              max_images: 10,
+              available: true,
+              environment_variables: ["QWEN_API_KEY"],
+            },
+          ]);
+        }
         if (path === "/api/chats" || path === "/api/chats?archived=true") {
           return jsonResponse(
             path.includes("archived") || !created
@@ -412,6 +425,7 @@ describe("App chat navigation", () => {
       vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
         const path = String(input);
         if (path === "/api/project") return jsonResponse(project);
+        if (path === "/api/models") return jsonResponse([]);
         if (path === "/api/chats" || path === "/api/chats?archived=true") {
           return jsonResponse([]);
         }
@@ -483,6 +497,19 @@ describe("App chat navigation", () => {
             ocr: { available: true, cuda: true, model_dir: "models/ocr" },
           });
         }
+        if (path === "/api/models") {
+          return jsonResponse([
+            {
+              provider: "qwen",
+              model: "qwen3.7-flash",
+              capabilities: ["text", "vision"],
+              context_tokens: 131072,
+              max_images: 10,
+              available: true,
+              environment_variables: ["QWEN_API_KEY"],
+            },
+          ]);
+        }
         if (path === "/api/chats" || path === "/api/chats?archived=true") {
           return jsonResponse([]);
         }
@@ -491,6 +518,8 @@ describe("App chat navigation", () => {
             image_count: 12,
             batch_count: 3,
             first_paths: ["resources/manga/1.jpg", "resources/manga/2.jpg"],
+            skipped: [],
+            errors: [],
           });
         }
         if (path === "/api/extractions" && init?.method === "POST") {

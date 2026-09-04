@@ -10,6 +10,7 @@ from rar_agent.workflow.manga.models import (
     NamedCharacterCatalog,
     NamedCharacterCatalogPayload,
 )
+from rar_agent.workflow.manga.parsing import non_negative_int
 
 _UNKNOWN = {"", "unknown", "null", "none"}
 
@@ -65,8 +66,8 @@ def validate_character_assignments(
     supplied: dict[tuple[int, int], str | None] = {}
     for value in payload.assignments:
         key = (
-            _non_negative_int(value.batch_index, "batch_index"),
-            _non_negative_int(value.local_character_index, "local_character_index"),
+            non_negative_int(value.batch_index, "batch_index"),
+            non_negative_int(value.local_character_index, "local_character_index"),
         )
         if key in supplied:
             raise ValueError("every local character must appear exactly once")
@@ -117,21 +118,6 @@ def _clean_strings(values: list[str], *, excluded: set[str]) -> list[str]:
         ):
             continue
         result.append(normalized)
-    return result
-
-
-def _non_negative_int(value: int | str, label: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be an integer")
-    if isinstance(value, int):
-        result = value
-    else:
-        normalized = value.strip()
-        if not normalized.isdigit():
-            raise ValueError(f"{label} must be an integer")
-        result = int(normalized)
-    if result < 0:
-        raise ValueError(f"{label} must not be negative")
     return result
 
 

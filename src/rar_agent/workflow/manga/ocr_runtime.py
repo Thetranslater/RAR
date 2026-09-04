@@ -8,6 +8,7 @@ import multiprocessing
 import os
 import subprocess
 import sys
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ProcessPoolExecutor
 from concurrent.futures.process import BrokenProcessPool
 from pathlib import Path
@@ -92,6 +93,7 @@ class PaddleOcrWorkerManager:
         pages: list[ImagePage],
         *,
         batch_size: int,
+        progress_callback: Callable[[int, int], Awaitable[None]] | None = None,
     ) -> list[OcrPageResult]:
         if not self.capability.available:
             raise RuntimeError(self.capability.reason or "OCR is unavailable")
@@ -122,8 +124,15 @@ class PaddleOcrWorkerManager:
                         )
                         for page in batch
                     )
+                    if progress_callback is not None:
+                        await progress_callback(
+                            min(offset + len(batch), len(pages)),
+                            len(pages),
+                        )
                     continue
                 results.extend(OcrPageResult.model_validate(value) for value in raw)
+                if progress_callback is not None:
+                    await progress_callback(min(offset + len(batch), len(pages)), len(pages))
             return sorted(results, key=lambda value: value.page_index)
         finally:
             await self._leave()

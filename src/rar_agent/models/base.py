@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from pathlib import PurePath, PureWindowsPath
 from typing import Annotated, Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from rar_agent.paths import workspace_relative_path
 
 JsonObject = dict[str, Any]
 
@@ -26,17 +27,6 @@ class ToolCall(ModelContract):
     arguments: JsonObject
 
 
-def _workspace_relative_path(value: str) -> str:
-    normalized = value.replace("\\", "/").strip()
-    if not normalized:
-        raise ValueError("path must not be empty")
-    if PurePath(normalized).is_absolute() or PureWindowsPath(normalized).is_absolute():
-        raise ValueError("path must be workspace-relative")
-    if ".." in PurePath(normalized).parts:
-        raise ValueError("path must be workspace-relative")
-    return normalized
-
-
 class TextContent(ModelContract):
     type: Literal["text"] = "text"
     text: str
@@ -46,7 +36,7 @@ class LocalImageContent(ModelContract):
     type: Literal["local_image"] = "local_image"
     path: str
 
-    _validate_path = field_validator("path")(_workspace_relative_path)
+    _validate_path = field_validator("path")(workspace_relative_path)
 
 
 ModelContent = Annotated[

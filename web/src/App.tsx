@@ -50,6 +50,16 @@ type Project = {
     reason?: string | null;
   };
 };
+type ModelOption = {
+  provider: string;
+  model: string;
+  capabilities: Array<"text" | "vision">;
+  context_tokens: number;
+  max_images: number;
+  available: boolean;
+  environment_variables: string[];
+  reason?: string | null;
+};
 type RunStatus =
   | "queued"
   | "running"
@@ -106,10 +116,17 @@ type ExtractionState = {
   stage?: string;
   dataset_root?: string;
   error?: string;
+  workflow_type?: "text" | "manga";
+  progress?: Record<string, { current: number; total: number }>;
 };
 
 const terminalRuns = new Set<RunStatus>(["completed", "failed", "cancelled"]);
-const terminalExtractions = new Set(["completed", "failed", "incomplete"]);
+const terminalExtractions = new Set([
+  "completed",
+  "failed",
+  "incomplete",
+  "cancelled",
+]);
 const stageNames: Record<string, string> = {
   chunk: "整理原文",
   plot_extraction: "提取剧情",
@@ -577,6 +594,17 @@ function Workspace() {
     );
   }
 
+  async function cancelExtraction() {
+    if (!extraction) return;
+    const value = await api<ExtractionState>(
+      "/api/extractions/" + extraction.task + "/cancel",
+      { method: "POST" },
+    );
+    setExtraction(value);
+    if (selectedId) await loadMessages(selectedId);
+    await refreshChats();
+  }
+
   const visibleMessages = messages.filter(
     (message) =>
       message.kind === "event" ||
@@ -775,10 +803,7 @@ function Workspace() {
           )}
         </section>
 
-        {extraction &&
-          !["completed", "failed", "incomplete"].includes(
-            extraction.status,
-          ) && (
+        {extraction && !terminalExtractions.has(extraction.status) && (
             <div className={"run-banner " + extraction.status}>
               {extraction.status === "awaiting_confirmation" ? (
                 <Check size={17} />
@@ -793,6 +818,13 @@ function Workspace() {
                 </strong>
                 {stageDescriptions[extraction.stage ?? ""] ??
                   "正在初始化提取任务"}
+                {Object.entries(extraction.progress ?? {}).map(
+                  ([stage, value]) => (
+                    <small key={stage}>
+                      {stage === "ocr" ? "OCR 页面" : stageNames[stage] ?? stage}: {value.current}/{value.total}
+                    </small>
+                  ),
+                )}
               </span>
               {extraction.status === "awaiting_confirmation" && (
                 <button
@@ -802,6 +834,14 @@ function Workspace() {
                   onClick={() => void confirmStage()}
                 >
                   确认并继续
+                </button>
+              )}
+              {extraction.status !== "awaiting_confirmation" && (
+                <button
+                  className="confirm-button"
+                  onClick={() => void cancelExtraction()}
+                >
+                  停止
                 </button>
               )}
             </div>
@@ -1127,8 +1167,27 @@ function ExtractionDialog({
   const [imageBatchSize, setImageBatchSize] = useState(5);
   const [ocrEnabled, setOcrEnabled] = useState(false);
   const [preview, setPreview] = useState<string>();
+  const [previewHasErrors, setPreviewHasErrors] = useState(false);
+  const [modelOptions, setModelOptions] = useState<ModelOption[]>([]);
+  const [visionModel, setVisionModel] = useState("qwen3.7-flash");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string>();
+  const visionModels = modelOptions.filter((value) =>
+    value.capabilities.includes("vision"),
+  );
+  const selectedVision = visionModels.find((value) => value.model === visionModel);
+
+  useEffect(() => {
+    void api<ModelOption[]>("/api/models")
+      .then(setModelOptions)
+      .catch((requestError: unknown) => {
+        setError(
+          requestError instanceof Error
+            ? requestError.message
+            : "无法读取模型配置",
+        );
+      });
+  }, []);
 
   async function submit(event: FormEvent) {
     event.preventDefault();
@@ -1152,7 +1211,7 @@ function ExtractionDialog({
             : {}),
           ...(workflowType === "manga"
             ? {
-                vision_model: "qwen3.7-flash",
+                vision_model: visionModel,
                 image_batch_size: imageBatchSize,
                 ocr_enabled: ocrEnabled,
               }
@@ -1186,6 +1245,7 @@ function ExtractionDialog({
     setBusy(true);
     setError(undefined);
     setPreview(undefined);
+    setPreviewHasErrors(false);
     try {
       const query = new URLSearchParams({
         path,
@@ -1196,9 +1256,21 @@ function ExtractionDialog({
         image_count: number;
         batch_count: number;
         first_paths: string[];
+        skipped: Array<{ path: string; reason: string }>;
+        errors: Array<{ path: string; reason: string }>;
+        debug_image_count?: number;
+        debug_batch_count?: number;
       }>("/api/resources/manga/preview?" + query);
+      setPreviewHasErrors(value.image_count === 0 || value.errors.length > 0);
       setPreview(
         `识别到 ${value.image_count} 张图片、${value.batch_count} 个批次。` +
+          (value.debug_batch_count !== undefined
+            ? ` 调试模式将处理 ${value.debug_image_count} 张、${value.debug_batch_count} 批。`
+            : "") +
+          (value.skipped.length ? ` 跳过 ${value.skipped.length} 项。` : "") +
+          (value.errors.length
+            ? ` ${value.errors.length} 个文件损坏：${value.errors.map((item) => item.path).join("、")}。`
+            : "") +
           (value.first_paths.length
             ? ` 排序开头：${value.first_paths.join("、")}`
             : ""),
@@ -1270,7 +1342,11 @@ function ExtractionDialog({
           <input
             required
             value={path}
-            onChange={(event) => setPath(event.target.value)}
+            onChange={(event) => {
+              setPath(event.target.value);
+              setPreview(undefined);
+              setPreviewHasErrors(false);
+            }}
             placeholder={
               workflowType === "manga" ? "resources/manga" : "resources/book.txt"
             }
@@ -1307,11 +1383,24 @@ function ExtractionDialog({
           <>
             <label>
               视觉模型
-              <select disabled={!project?.vision_model_ready} value="qwen3.7-flash">
-                <option value="qwen3.7-flash">Qwen3.7 Flash</option>
+              <select
+                disabled={!visionModels.length}
+                value={visionModel}
+                onChange={(event) => setVisionModel(event.target.value)}
+              >
+                {visionModels.map((option) => (
+                  <option
+                    key={`${option.provider}:${option.model}`}
+                    value={option.model}
+                    disabled={!option.available}
+                  >
+                    {option.model} · {option.provider}
+                    {option.available ? "" : "（不可用）"}
+                  </option>
+                ))}
               </select>
-              {!project?.vision_model_ready && (
-                <small>未检测到 QWEN_API_KEY 或 DASHSCOPE_API_KEY</small>
+              {selectedVision && !selectedVision.available && (
+                <small>{selectedVision.reason}</small>
               )}
             </label>
             <label>
@@ -1383,7 +1472,11 @@ function ExtractionDialog({
           </button>
           <button
             className="primary"
-            disabled={busy || (workflowType === "manga" && !project?.vision_model_ready)}
+            disabled={
+              busy ||
+              (workflowType === "manga" &&
+                (!selectedVision || !selectedVision.available || previewHasErrors))
+            }
           >
             {busy ? (
               <LoaderCircle className="spin" size={16} />

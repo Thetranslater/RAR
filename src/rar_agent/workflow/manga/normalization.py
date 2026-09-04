@@ -11,6 +11,7 @@ from rar_agent.workflow.manga.models import (
     VisualExtractionPayload,
     VisualExtractionResult,
 )
+from rar_agent.workflow.manga.parsing import non_negative_int
 
 _UNKNOWN = {"", "unknown", "null", "none"}
 
@@ -22,7 +23,7 @@ def normalize_visual_extraction(
     characters: dict[int, LocalCharacter] = {}
     raw_order: list[int] = []
     for raw_character in payload.characters:
-        old_index = _index(raw_character.index, "character index")
+        old_index = non_negative_int(raw_character.index, "character index")
         if old_index in characters:
             raise ValueError(f"duplicate local character index: {old_index}")
         characters[old_index] = LocalCharacter(
@@ -76,23 +77,8 @@ def normalize_visual_extraction(
     )
 
 
-def _index(value: int | str, label: str) -> int:
-    if isinstance(value, bool):
-        raise ValueError(f"{label} must be an integer")
-    if isinstance(value, int):
-        result = value
-    else:
-        normalized = value.strip()
-        if not normalized.isdigit():
-            raise ValueError(f"{label} must be an integer")
-        result = int(normalized)
-    if result < 0:
-        raise ValueError(f"{label} must not be negative")
-    return result
-
-
 def _local_page(value: int | str, batch: ImageBatch) -> int:
-    page_index = _index(value, "page_index")
+    page_index = non_negative_int(value, "page_index")
     if page_index >= len(batch.page_indexes):
         raise ValueError(
             f"page_index {page_index} is outside batch {batch.batch_index}"

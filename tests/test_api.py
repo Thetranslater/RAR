@@ -53,6 +53,7 @@ def _wait_extraction(
 
 def _extraction_request(*, mode: str = "automatic") -> dict[str, Any]:
     return {
+        "workflow_type": "text",
         "mode": mode,
         "manifest": {
             "name": "测试作品",
@@ -263,6 +264,26 @@ def test_api_previews_and_runs_manga_workflow(tmp_path: Path) -> None:
     ]
     dataset = tmp_path / completed["dataset_root"] / "dataset.json"
     assert json.loads(dataset.read_text(encoding="utf-8"))["name"] == "Manga API"
+
+
+def test_api_rejects_manga_workflow_with_text_resource(tmp_path: Path) -> None:
+    runtime = AppRuntime(
+        project_root=tmp_path,
+        model_client=ScriptedModelClient([]),
+        model="text-model",
+        tokenizer=CharacterTokenizer(),
+        vision_model_client=ScriptedModelClient([], provider="qwen"),
+    )
+    request = _extraction_request()
+    request["workflow_type"] = "manga"
+
+    with TestClient(create_app(runtime)) as client:
+        response = client.post("/api/extractions", json=request)
+
+    assert response.status_code == 422
+    assert "manga resource" in response.text
+
+
 def test_api_returns_graceful_result_at_agent_round_limit(tmp_path: Path) -> None:
     responses = [
         ModelResponse(
@@ -361,6 +382,29 @@ def test_running_extraction_blocks_agent_turn_in_the_same_chat(
     assert blocked.status_code == 409
     assert "extraction is running" in blocked.json()["detail"]
     assert finished["status"] == "completed"
+
+
+def test_running_extraction_can_be_cancelled(tmp_path: Path) -> None:
+    source = tmp_path / "resources" / "book.txt"
+    source.parent.mkdir()
+    source.write_text("甲说：“你好。”", encoding="utf-8")  # noqa: RUF001
+    runtime = AppRuntime(
+        project_root=tmp_path,
+        model_client=SlowWorkflowClient(_workflow_responses()),
+        model="test-model",
+        tokenizer=CharacterTokenizer(),
+    )
+
+    with TestClient(create_app(runtime)) as client:
+        accepted = client.post("/api/extractions", json=_extraction_request())
+        task = accepted.json()["task"]
+        _wait_extraction(client, task, status="running", stage="plot_extraction")
+        cancelled = client.post(f"/api/extractions/{task}/cancel")
+        status = client.get(f"/api/extractions/{task}")
+
+    assert cancelled.status_code == 200
+    assert cancelled.json()["status"] == "cancelled"
+    assert status.json()["status"] == "cancelled"
 
 
 def test_staged_extraction_allows_agent_turn_but_waits_for_it_before_continuing(

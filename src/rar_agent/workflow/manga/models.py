@@ -2,23 +2,13 @@
 
 from __future__ import annotations
 
-from pathlib import PurePath, PureWindowsPath
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from rar_agent.paths import workspace_relative_path
+
 JsonObject = dict[str, Any]
-
-
-def workspace_relative_path(value: str) -> str:
-    normalized = value.replace("\\", "/").strip()
-    if not normalized:
-        raise ValueError("path must not be empty")
-    if PurePath(normalized).is_absolute() or PureWindowsPath(normalized).is_absolute():
-        raise ValueError("path must be workspace-relative")
-    if ".." in PurePath(normalized).parts:
-        raise ValueError("path must be workspace-relative")
-    return normalized
 
 
 class MangaModel(BaseModel):
