@@ -1,4 +1,38 @@
-"""File-checkpointed Manga Workflow for local image folders."""
+# ruff: noqa: RUF002
+"""带文件检查点的本地漫画对话数据集 Workflow。
+
+========
+
+核心编排位于 :meth:`MangaDatasetBuildWorkflow.run`。它按照以下顺序推进：
+
+1. ``_load_or_scan`` 扫描并排序漫画图片，生成页面和批次清单；
+2. ``_visual_extractions`` 并行调用 VLM 提取对白、局部角色、话标题和剧情；
+3. ``_ocr_pages`` 与 VLM 同时执行可选 OCR，随后由 ``align_ocr_results``
+   对同页对白进行文字校正；
+4. ``_character_catalog`` 从全部局部观察建立具名角色参考表，
+   ``_character_assignments`` 再把每批的局部角色映射到正式名称；
+5. ``reconstruct_manga_chapters`` 按明确的“话”起点重建章节和初步对白；
+6. ``_dialogue_revisions`` 使用文本模型逐话复核说话者、顺序和对白内容；
+7. ``_character_profiles`` 汇总被实际使用角色的视觉描述并生成角色档案；
+8. ``_plots``、``_conversations`` 和 ``_attach_character_refs`` 组装统一领域模型，
+   最后写入 DatasetBundle、角色文本、ShareGPT 导出和摘要报告。
+
+------------
+
+``_run_jsonl_stage`` 是所有可并行模型阶段共用的检查点执行器：它按 index
+复用有效结果、只重跑缺失或空结果，并在失败位置保留空 ``result``。
+``_generate_text`` 统一处理文本模型的结构化 JSON 调用；``_assignment_groups``
+和 ``_fits_text_budget`` 负责按上下文预算拆分角色映射请求。
+``_read_workflow_config`` 保证恢复时继续使用首次运行的非敏感配置。
+``_stage_event`` 与 ``_stage_progress`` 向 API/UI 发布阶段和细粒度进度。
+``_write_incomplete_visual_report`` 记录视觉阶段的不完整结果，
+``_write_report`` 则生成完成任务的机器可读质量摘要。
+
+持久化路径集中定义在 :class:`MangaPaths`；可调整参数集中定义在
+:class:`MangaWorkflowConfig`。纯确定性处理分别位于同目录的 ``scanning.py``、
+``normalization.py``、``characters.py``、``chapters.py`` 和 ``ocr.py``，本文件
+主要负责阶段编排、模型调用、检查点恢复与最终产物组装。
+"""
 
 from __future__ import annotations
 
