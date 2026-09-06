@@ -6,38 +6,17 @@ non-commercial use and exports maintained DatasetBundle files to ShareGPT JSONL.
 
 RAR combines two execution paths behind one chat interface:
 
-- `DatasetBuildWorkflow` runs the fixed text pipeline: TextChunk → Plot extraction →
-  candidate aggregation plus formal-name/profile generation → Plot reconstruction →
-  dialogue extraction → DatasetBundle → ShareGPT.
+- `DatasetBuildWorkflow` runs the fixed text pipeline.
 - `AgentHarness` handles open-ended inspection, correction, merge, and re-export requests
-  through workspace-contained tools. It does not create a dedicated workflow class for
-  every task.
+  through workspace-contained tools.
 
-## Current V1 capabilities
-
-- UTF-8 text files and ordered multi-resource InputManifests, with volume/chapter-aware
-  section splitting before sentence-complete token chunking.
-- File-based checkpoints with `result: {}` placeholders and deterministic resume.
-- Source references from every dialogue back to PlotChunk and, when alignment succeeds,
-  TextChunk character spans.
-- One profile call per deterministically aggregated character; the selected formal name is
-  moved first and every other observed name is retained as an alias.
-- DatasetBundle, plain-text character profiles, and per-character ShareGPT JSONL.
-- DeepSeek and Qwen through provider-neutral OpenAI-compatible adapters.
-- Project-local SQLite for chat, tool-call, usage, and operational records only.
-- Project-scoped chat management with lazy creation, archive/restore, pagination, and
-  background Agent runs that survive page switching.
-- Temporary approval requests for risky tools, per-chat cancellation, complete-turn context
-  trimming, and one global model-concurrency scheduler shared by Chat and Workflow.
-- Automatic and stage-confirmed extraction modes through the local API and Web UI.
-- Responsive local React chat interface; no remote deployment or account system.
-
+## V1 capabilities
 Manga, scan, and video workflows are extension points and are not implemented by the text
 core yet. HTML reports also remain an optional post-V1 renderer.
 
-## Development setup
+## setup
 
-Python 3.12 and pnpm are required.
+Python 3.12 required.
 
 ```powershell
 python -m venv .venv
@@ -49,16 +28,8 @@ pnpm --dir web run build
 Set one provider key in the environment. Keys are read at runtime and are never written to
 RAR configuration or SQLite.
 
-```powershell
-$env:DEEPSEEK_API_KEY = "..."
-# or: $env:QWEN_API_KEY = "..."
-```
-
 Start the local service for the current Project directory:
 
 ```powershell
 .venv\Scripts\rar-agent serve --project . --provider deepseek --model deepseek-chat
 ```
-
-Then open `http://127.0.0.1:8765`. The interface can start without a key for browsing local
-results, but model-backed chat and extraction return a clear configuration error.
